@@ -83,7 +83,7 @@ void initDefaults() {
   }
   
   // Raids
-  twitchCfg.raids.msg[0] = "🚨 RAID 🚨";
+  twitchCfg.raids.msg[0] = "\xF0\x9F\x9A\xA8 RAID \xF0\x9F\x9A\xA8";
   twitchCfg.raids.msg[1] = "from";
   twitchCfg.raids.msg[2] = "{user}";
   for(int i=0; i<3; i++) {
@@ -399,9 +399,37 @@ void printEvent(EventConfig& cfg, String username, String val1, String val2) {
   }
 }
 
-// ========== TWITCH INTEGRATION ==========
+// ========== TWITCH IRC PARSING ==========
 
-// [REPLACE] parseTwitchMessage function
+/**
+ * Extracts the message payload from a raw Twitch IRC line.
+ *
+ * Twitch IRC PRIVMSG lines look like:
+ *   @tags :nick!user@host PRIVMSG #channel :the actual message here
+ *
+ * The message text always follows the FIRST " :" that appears AFTER
+ * the PRIVMSG or USERNOTICE token. Using lastIndexOf(":") was wrong
+ * because it would split on any colon inside the message itself
+ * (e.g. "hello :>" would return just ">").
+ *
+ * This helper anchors on the command token first, then finds the
+ * correct " :" separator, so colons in chat messages are preserved.
+ */
+String extractIRCMessage(const String& line) {
+  // Find the command token (PRIVMSG or USERNOTICE)
+  int cmdPos = line.indexOf(" PRIVMSG ");
+  if (cmdPos < 0) cmdPos = line.indexOf(" USERNOTICE ");
+  if (cmdPos < 0) return "";
+
+  // The message payload starts after the first " :" AFTER the command
+  int msgStart = line.indexOf(" :", cmdPos);
+  if (msgStart < 0) return "";
+
+  String payload = line.substring(msgStart + 2); // skip the " :"
+  payload.replace("\r", "");  // strip trailing carriage return if present
+  return payload;
+}
+
 void parseTwitchMessage(String msg) {
   if(msg.indexOf("msg-id=sub") > 0) {
     String user = msg.substring(msg.indexOf("display-name=") + 13);
@@ -427,8 +455,13 @@ void parseTwitchMessage(String msg) {
 
     String user = msg.substring(msg.indexOf("display-name=") + 13);
     user = user.substring(0, user.indexOf(";"));
-    String reward = msg.substring(msg.lastIndexOf(":") + 1);
+
+    // FIX: Use extractIRCMessage() instead of lastIndexOf(":").
+    // Previously, lastIndexOf(":") would split on any colon inside the
+    // message text (e.g. "hello :>" would only print ">").
+    String reward = extractIRCMessage(msg);
     reward.trim();
+
     printEvent(twitchCfg.points, user, "", reward);
   }
 
@@ -648,7 +681,7 @@ textarea{width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:3p
 <div id="cfg"></div>
 
 <div class="card">
-  <button class="save" onclick="save()">💾 Save Configuration</button>
+  <button class="save" onclick="save()">&#128190; Save Configuration</button>
 </div>
 
 <div class="card">
@@ -664,8 +697,8 @@ textarea{width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:3p
     <div class="ctl"><input type="checkbox" id="t_b" checked><span class="tiny-lbl">Bold</span></div>
     <div class="ctl"><input type="checkbox" id="t_i"><span class="tiny-lbl">Inv</span></div>
   </div>
-  <button onclick="print()">🖨️ Print Test</button>
-  <button onclick="feed()" style="background:#6c757d">📄 Feed 3 Lines</button>
+  <button onclick="print()">&#128424;&#65039; Print Test</button>
+  <button onclick="feed()" style="background:#6c757d">&#128196; Feed 3 Lines</button>
 </div>
 
 <script>
@@ -694,7 +727,7 @@ function render() {
     }
     h += `<div style="margin-top:5px;font-size:12px;display:flex;align-items:center;justify-content:space-between">
       <span>Feed lines: <input type="number" id="${k}_f" style="width:40px" value="3"></span>
-      <button class="test" onclick="test('${k}')">🧪 Test ${titles[i]}</button>
+      <button class="test" onclick="test('${k}')">&#129514; Test ${titles[i]}</button>
     </div>`;
     if(k === 'pts') {
       h += `<div style="margin-top:6px;font-size:12px;"><label>Custom Reward ID (blank = all):<br><input type="text" id="pts_filter" style="width:100%" placeholder="Reward UUID (e.g. a1b2c3d4-e5f6-...)"></label></div>`;
