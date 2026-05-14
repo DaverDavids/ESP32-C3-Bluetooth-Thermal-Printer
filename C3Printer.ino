@@ -8,7 +8,6 @@
 #include <BLEUtils.h>
 #include <BLEClient.h>
 #include <Adafruit_GFX.h>
-#include <U8g2_for_Adafruit_GFX.h>
 #include <Secrets.h>
 
 const char* hostname = "c3printer";
@@ -33,7 +32,7 @@ String pointsRewardFilter = "";  // Empty = trigger on ALL redemptions
 
 bool shouldSaveConfig = false;
 const int PRINTER_WIDTH = 400; // dots
-const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8; // 50 bytes
+const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8; // 48 bytes
 
 struct EventConfig {
   bool enabled = true;
@@ -77,7 +76,7 @@ void initDefaults() {
     twitchCfg.points.bold[i] = true; twitchCfg.points.invert[i] = false;
   }
 
-  twitchCfg.raids.msg[0] = "** RAID **";
+  twitchCfg.raids.msg[0] = "\xF0\x9F\x9A\xA8 RAID \xF0\x9F\x9A\xA8";
   twitchCfg.raids.msg[1] = "from";
   twitchCfg.raids.msg[2] = "{user}";
   for(int i=0; i<3; i++) {
@@ -116,47 +115,6 @@ public:
   }
 };
 
-// ========== U8g2 FONT HELPERS ==========
-
-static const uint8_t* pickFont(int size, bool bold) {
-  static const uint8_t* reg[] = {
-    u8g2_font_6x10_tf,
-    u8g2_font_8x13_tf,
-    u8g2_font_10x20_tf,
-    u8g2_font_10x20_tf,
-    u8g2_font_10x20_tf,
-    u8g2_font_10x20_tf,
-    u8g2_font_10x20_tf,
-    u8g2_font_10x20_tf,
-  };
-  static const uint8_t* bld[] = {
-    u8g2_font_6x10_mf,
-    u8g2_font_8x13B_tf,
-    u8g2_font_10x20_mf,
-    u8g2_font_10x20_mf,
-    u8g2_font_10x20_mf,
-    u8g2_font_10x20_mf,
-    u8g2_font_10x20_mf,
-    u8g2_font_10x20_mf,
-  };
-  int idx = constrain(size, 1, 8) - 1;
-  return bold ? bld[idx] : reg[idx];
-}
-
-static int fontBaseHeight(int size) {
-  switch(constrain(size, 1, 8)) {
-    case 1: return 10;
-    case 2: return 13;
-    default: return 20;
-  }
-}
-
-static int gfxScale(int size) {
-  int s = constrain(size, 1, 8);
-  if(s <= 2) return 1;
-  return s - 1;
-}
-
 // ========== TEXT PROCESSING ==========
 
 String processNewlines(String text) {
@@ -165,70 +123,75 @@ String processNewlines(String text) {
   return text;
 }
 
-// Strips raw control chars only; U8g2 handles all UTF-8 natively.
+// Clean text for printing - keep printable ASCII only.
+// Multi-byte UTF-8 sequences and control characters are replaced with '?'.
 String sanitizeText(String text) {
   String result = "";
-  for (int i = 0; i < (int)text.length(); i++) {
+  int i = 0;
+  while (i < (int)text.length()) {
     unsigned char c = (unsigned char)text[i];
-    if (c == '\n' || c >= 0x20) result += (char)c;
+
+    if (c == '\n') {
+      result += '\n';
+      i++;
+    } else if (c >= 32 && c <= 126) {
+      // Plain printable ASCII - keep as-is
+      result += (char)c;
+      i++;
+    } else if (c < 32 || c == 127) {
+      // Control character - skip silently
+      i++;
+    } else if (c >= 0xF0) {
+      // 4-byte UTF-8 (emoji etc.) - replace whole sequence with '?'
+      result += '?';
+      i += 4;
+    } else if (c >= 0xE0) {
+      // 3-byte UTF-8 - replace with '?'
+      result += '?';
+      i += 3;
+    } else if (c >= 0xC0) {
+      // 2-byte UTF-8 - replace with '?'
+      result += '?';
+      i += 2;
+    } else {
+      // Stray continuation byte - skip
+      i++;
+    }
   }
   return result;
 }
 
-/**
- * Word-wrap UTF-8 text to fit within maxPixelWidth.
- * Scratch canvas is used only for getUTF8Width() measurement — never drawn to.
- */
-String wordWrap(String text, int maxPixelWidth, int fontSize, bool bold) {
-  PrintCanvas measure(PRINTER_WIDTH, 32);
-  U8G2_FOR_ADAFRUIT_GFX u8m;
-  u8m.begin(measure);
-  u8m.setFont(pickFont(fontSize, bold));
-  u8m.setFontMode(1);
-  // NOTE: setDrawColor / setForegroundColor not called here —
-  //       this canvas is measurement-only, no pixels are written.
-  int scale = gfxScale(fontSize);
-
+String wordWrap(String text, int maxWidth, int fontSize) {
   String result = "";
-  int lineStart = 0;
+  int charWidth = 6 * fontSize;
+  int maxCharsPerLine = maxWidth / charWidth;
+  if(maxCharsPerLine < 5) maxCharsPerLine = 5;
 
-  while (lineStart < (int)text.length()) {
+  int lineStart = 0;
+  while(lineStart < (int)text.length()) {
     int lineEnd = text.indexOf('\n', lineStart);
-    if (lineEnd < 0) lineEnd = text.length();
+    if(lineEnd < 0) lineEnd = text.length();
     String line = text.substring(lineStart, lineEnd);
 
-    int lineW = u8m.getUTF8Width(line.c_str()) * scale;
-    if (lineW <= maxPixelWidth) {
+    if((int)line.length() <= maxCharsPerLine) {
       result += line;
-      if (lineEnd < (int)text.length()) result += "\n";
-      lineStart = lineEnd + 1;
-      continue;
-    }
-
-    while (line.length() > 0) {
-      int lo = 1, hi = line.length(), fit = 0;
-      while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        String seg = line.substring(0, mid);
-        int segW = u8m.getUTF8Width(seg.c_str()) * scale;
-        if (segW <= maxPixelWidth) { fit = mid; lo = mid + 1; }
-        else                       { hi = mid - 1; }
+      if(lineEnd < (int)text.length()) result += "\n";
+    } else {
+      while(line.length() > 0) {
+        if((int)line.length() <= maxCharsPerLine) {
+          result += line;
+          break;
+        }
+        int breakPoint = maxCharsPerLine;
+        int lastSpace = line.lastIndexOf(' ', breakPoint);
+        if(lastSpace > 0) breakPoint = lastSpace;
+        result += line.substring(0, breakPoint);
+        result += "\n";
+        line = line.substring(breakPoint);
+        if(line.startsWith(" ")) line = line.substring(1);
       }
-      if (fit == 0) fit = 1;
-
-      int breakPoint = fit;
-      if (fit < (int)line.length()) {
-        int lastSpace = line.lastIndexOf(' ', fit);
-        if (lastSpace > 0) breakPoint = lastSpace;
-      }
-
-      result += line.substring(0, breakPoint);
-      result += "\n";
-      line = line.substring(breakPoint);
-      if (line.startsWith(" ")) line = line.substring(1);
+      if(lineEnd < (int)text.length()) result += "\n";
     }
-
-    if (lineEnd < (int)text.length()) result += "\n";
     lineStart = lineEnd + 1;
   }
   return result;
@@ -246,6 +209,9 @@ void initPrinter() {
   uint8_t init[] = {0x1B, 0x40};
   sendCmd(init, 2);
   delay(100);
+  uint8_t utf8[] = {0x1B, 0x74, 0x10};
+  sendCmd(utf8, 3);
+  delay(50);
 }
 
 void printBitmap(uint8_t *bitmap, int width, int height) {
@@ -281,16 +247,14 @@ bool printToThermal(String text, int textSize, int align, bool bold, bool invert
   text = processNewlines(text);
   int fontSize = constrain(textSize, 1, 8);
   int maxTextWidth = PRINTER_WIDTH - 6;
-  text = wordWrap(text, maxTextWidth, fontSize, bold);
+  text = wordWrap(text, maxTextWidth, fontSize);
 
   int totalLines = 1;
   for(int i = 0; i < (int)text.length(); i++) if(text[i] == '\n') totalLines++;
 
-  int scale       = gfxScale(fontSize);
-  int baseH       = fontBaseHeight(fontSize);
-  int charHeight  = baseH * scale;
-  int lineSpacing = 4 * scale;
-  int lineHeight  = charHeight + lineSpacing;
+  int charHeight   = 8 * fontSize;
+  int lineSpacing  = 2 * fontSize;
+  int lineHeight   = charHeight + lineSpacing;
   int linesPerChunk = 200 / lineHeight;
   if(linesPerChunk < 1) linesPerChunk = 1;
 
@@ -300,30 +264,27 @@ bool printToThermal(String text, int textSize, int align, bool bold, bool invert
   while(currentLineIndex < totalLines) {
     int chunkLineCount = 0;
     int chunkHeight = 0;
-    if(currentLineIndex == 0) chunkHeight += fontSize * 4;
+    if(currentLineIndex == 0) chunkHeight += fontSize * 2;
 
     for(int i = 0; i < linesPerChunk && (currentLineIndex + i) < totalLines; i++) {
       chunkLineCount++;
       chunkHeight += lineHeight;
     }
-    if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += fontSize * 4;
+    if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += fontSize * 2;
 
     PrintCanvas canvas(PRINTER_WIDTH, chunkHeight);
     if(!canvas.buffer) { Serial.println("Chunk alloc failed!"); return false; }
 
-    U8G2_FOR_ADAFRUIT_GFX u8g2;
-    u8g2.begin(canvas);
-    u8g2.setFont(pickFont(fontSize, bold));
-    u8g2.setFontMode(1);
-    u8g2.setForegroundColor(invert ? 0 : 1);
-    u8g2.setBackgroundColor(invert ? 1 : 0);
-    canvas.setTextSize(scale);
+    canvas.setTextSize(fontSize);
+    canvas.setTextWrap(false);
+    if(invert) {
+      canvas.fillRect(0, 0, PRINTER_WIDTH, chunkHeight, 1);
+      canvas.setTextColor(0);
+    } else {
+      canvas.setTextColor(1);
+    }
 
-    if(invert) canvas.fillRect(0, 0, PRINTER_WIDTH, chunkHeight, 1);
-
-    int drawY = (currentLineIndex == 0)
-                  ? (fontSize * 4) + charHeight
-                  : charHeight;
+    int drawY = (currentLineIndex == 0) ? fontSize : 0;
 
     for(int i = 0; i < chunkLineCount; i++) {
       int lineEnd = text.indexOf('\n', textIndex);
@@ -331,21 +292,20 @@ bool printToThermal(String text, int textSize, int align, bool bold, bool invert
       String line = text.substring(textIndex, lineEnd);
 
       if(line.length() > 0) {
-        int lineW = u8g2.getUTF8Width(line.c_str()) * scale;
+        int16_t x1, y1; uint16_t w, h;
+        canvas.getTextBounds(line, 0, 0, &x1, &y1, &w, &h);
         int x = 2;
-        if(align == 1)      x = (PRINTER_WIDTH - lineW) / 2;
-        else if(align == 2) x = PRINTER_WIDTH - lineW - 2;
+        if(align == 1) x = (PRINTER_WIDTH - w) / 2;
+        else if(align == 2) x = PRINTER_WIDTH - w - 2;
         if(x < 2) x = 2;
-
-        u8g2.setCursor(x, drawY);
-        u8g2.print(line);
-
+        canvas.setCursor(x, drawY);
+        canvas.print(line);
         if(bold) {
-          u8g2.setCursor(x + 1, drawY);
-          u8g2.print(line);
+          canvas.setCursor(x+1, drawY); canvas.print(line);
+          if(!invert) { canvas.setCursor(x, drawY+1); canvas.print(line); }
         }
       }
-      drawY    += lineHeight;
+      drawY   += lineHeight;
       textIndex = lineEnd + 1;
     }
 
@@ -375,26 +335,56 @@ void printEvent(EventConfig& cfg, String username, String val1, String val2) {
 
 // ========== TWITCH IRC PARSING ==========
 
+/**
+ * Robustly extracts the chat message payload from a raw Twitch IRC line.
+ *
+ * Twitch IRC lines look like:
+ *   @tags :nick!user@host PRIVMSG #channel :the actual message here :> :-)
+ *
+ * Strategy:
+ *   1. Find the PRIVMSG or USERNOTICE command token.
+ *   2. From there, find the '#' that starts the channel name.
+ *   3. Find the ' ' space after the channel name.
+ *   4. The very next character must be ':', then the message begins.
+ *
+ * This is the only unambiguous boundary: no matter how many colons appear
+ * inside the message text (e.g. ":>", ":-)", "http://..."), they cannot
+ * be mistaken for the message-start delimiter.
+ */
 String extractIRCMessage(const String& line) {
+  // Step 1: find the command
   int cmdPos = line.indexOf(" PRIVMSG ");
   if (cmdPos < 0) cmdPos = line.indexOf(" USERNOTICE ");
   if (cmdPos < 0) return "";
+
+  // Step 2: find '#channel' after the command token
   int hashPos = line.indexOf('#', cmdPos);
   if (hashPos < 0) return "";
+
+  // Step 3: find the space after the channel name
   int spaceAfterChan = line.indexOf(' ', hashPos);
   if (spaceAfterChan < 0) return "";
+
+  // Step 4: the message payload begins right after that space+colon
+  // Confirm we have ' :' at this position
   if (spaceAfterChan + 1 >= (int)line.length() || line[spaceAfterChan + 1] != ':') return "";
-  String payload = line.substring(spaceAfterChan + 2);
-  payload.replace("\r", "");
+
+  String payload = line.substring(spaceAfterChan + 2); // skip ' :'
+  payload.replace("\r", "");  // strip any trailing carriage return
   payload.trim();
   return payload;
 }
 
+/**
+ * Extracts a tag value from the Twitch IRC tag string.
+ * e.g. extractTag(line, "display-name") returns "DaverDavid"
+ */
 String extractTag(const String& line, const String& tagName) {
   String search = tagName + "=";
   int start = line.indexOf(search);
   if (start < 0) return "";
   start += search.length();
+  // Tags are semicolon-delimited; value ends at ';' or ' ' (start of non-tag section)
   int end = line.indexOf(';', start);
   int spaceEnd = line.indexOf(' ', start);
   if (end < 0 || (spaceEnd >= 0 && spaceEnd < end)) end = spaceEnd;
@@ -735,7 +725,7 @@ void handleRoot()   { server.send(200, "text/html; charset=UTF-8", htmlPage); }
 
 void handleStatus() {
   String json = "{\"printer\":" + String(printerConnected ? "true" : "false") +
-                ",\"twitch\":"+ String(twitchConnected  ? "true" : "false") + "}";
+                ",\"twitch\":"+  String(twitchConnected  ? "true" : "false") + "}";
   server.send(200, "application/json", json);
 }
 
@@ -779,7 +769,7 @@ void handlePrint() {
   int  al  = server.hasArg("al")  ? server.arg("al").toInt()        : 1;
   bool b   = server.hasArg("b")   ? (server.arg("b")   == "1")      : true;
   bool inv = server.hasArg("inv") ? (server.arg("inv") == "1")      : false;
-  printToThermal(sanitizeText(text), sz, al, b, inv, 3);
+  printToThermal(text, sz, al, b, inv, 3);
   server.send(200, "text/plain", "Printed!");
 }
 
@@ -830,10 +820,10 @@ void handleTestEvent() {
     tCfg.bold[i]   = server.arg("b"+String(i)) == "1";
     tCfg.invert[i] = server.arg("i"+String(i)) == "1";
   }
-  if     (type == "sub")  printEvent(tCfg, "TestUser",        "",     "");
-  else if(type == "bit")  printEvent(tCfg, "TestUser",        "1000", "");
-  else if(type == "pts")  printEvent(tCfg, "Espa\xc3\xb1ol", "",     "Caf\xc3\xa9 \xe2\x98\x95 :>");
-  else if(type == "raid") printEvent(tCfg, "TestUser",        "",     "");
+  if     (type == "sub")  printEvent(tCfg, "TestUser", "",     "");
+  else if(type == "bit")  printEvent(tCfg, "TestUser", "1000", "");
+  else if(type == "pts")  printEvent(tCfg, "TestUser", "",     "Hydrate :>");
+  else if(type == "raid") printEvent(tCfg, "TestUser", "",     "");
   server.send(200, "text/plain", "Test Sent");
 }
 
@@ -842,7 +832,7 @@ void handleTestEvent() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\nESP32-C3 Thermal Printer (U8g2 Unicode Mode)");
+  Serial.println("\n\nESP32-C3 Thermal Printer (Bitmap Mode)");
   loadConfig();
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
