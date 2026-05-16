@@ -38,10 +38,10 @@ const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 // ========== U8G2 FONT TABLE ==========
 // Font IDs are stored in EventConfig.font[] and in Preferences (key _s).
 //
-// _tf   = extended Latin (ISO 8859 range, accents, etc.)
-// _t_all = Latin + Cyrillic + Greek + misc Unicode symbols
-// _t_cyrillic = ASCII + Cyrillic block
-// u8g2_font_unifont_t_unifont = ~50k Unicode codepoints (large, use sparingly)
+// _tf  = transparent, full character set (ISO 8859 Latin extended — accents, etc.)
+// _tr  = transparent, ASCII 32-127 only
+// Note: the X11 monospace fonts (5x7, 6x10, 7x13, etc.) do NOT have a _t_all
+//       variant. Use _tf for extended Latin. For full Unicode use Unifont.
 
 struct FontEntry {
   uint8_t     id;
@@ -50,69 +50,63 @@ struct FontEntry {
   uint8_t     charH;   // nominal pixel height for line-spacing calculation
 };
 
-#define FONT_5X7_LATIN    0
-#define FONT_5X7_ALL      1
-#define FONT_6X10_LATIN   2
-#define FONT_6X10_ALL     3
-#define FONT_7X13_LATIN   4
-#define FONT_7X13_ALL     5
-#define FONT_8X13_LATIN   6
-#define FONT_8X13_ALL     7
-#define FONT_9X15_LATIN   8
-#define FONT_9X15_ALL     9
-#define FONT_10X20_LATIN  10
-#define FONT_10X20_ALL    11
-#define FONT_NCENR12      12
-#define FONT_NCENR14      13
-#define FONT_NCENR18      14
-#define FONT_HELVR12      15
-#define FONT_HELVR14      16
-#define FONT_HELVR18      17
-#define FONT_HELVB12      18
-#define FONT_HELVB14      19
-#define FONT_HELVB18      20
-#define FONT_LOGISOSO28   21
-#define FONT_LOGISOSO32   22
-#define FONT_LOGISOSO42   23
-#define FONT_UNIFONT      24
-#define FONT_CYRILLIC_S   25
-#define FONT_CYRILLIC_L   26
+#define FONT_5X7         0
+#define FONT_6X10        1
+#define FONT_7X13        2
+#define FONT_7X13B       3
+#define FONT_8X13        4
+#define FONT_8X13B       5
+#define FONT_9X15        6
+#define FONT_9X15B       7
+#define FONT_10X20       8
+#define FONT_NCENR12     9
+#define FONT_NCENR14     10
+#define FONT_NCENR18     11
+#define FONT_HELVR12     12
+#define FONT_HELVR14     13
+#define FONT_HELVR18     14
+#define FONT_HELVB12     15
+#define FONT_HELVB14     16
+#define FONT_HELVB18     17
+#define FONT_LOGISOSO28  18
+#define FONT_LOGISOSO32  19
+#define FONT_LOGISOSO42  20
+#define FONT_UNIFONT     21
+#define FONT_CYRILLIC_S  22
+#define FONT_CYRILLIC_L  23
 
 const FontEntry FONT_TABLE[] = {
-  { FONT_5X7_LATIN,   "5x7 Latin",           u8g2_font_5x7_tf,               7  },
-  { FONT_5X7_ALL,     "5x7 All Scripts",     u8g2_font_5x7_t_all,            7  },
-  { FONT_6X10_LATIN,  "6x10 Latin",          u8g2_font_6x10_tf,              10 },
-  { FONT_6X10_ALL,    "6x10 All Scripts",    u8g2_font_6x10_t_all,           10 },
-  { FONT_7X13_LATIN,  "7x13 Latin",          u8g2_font_7x13_tf,              13 },
-  { FONT_7X13_ALL,    "7x13 All Scripts",    u8g2_font_7x13_t_all,           13 },
-  { FONT_8X13_LATIN,  "8x13 Latin",          u8g2_font_8x13_tf,              13 },
-  { FONT_8X13_ALL,    "8x13 All Scripts",    u8g2_font_8x13_t_all,           13 },
-  { FONT_9X15_LATIN,  "9x15 Latin",          u8g2_font_9x15_tf,              15 },
-  { FONT_9X15_ALL,    "9x15 All Scripts",    u8g2_font_9x15_t_all,           15 },
-  { FONT_10X20_LATIN, "10x20 Latin",         u8g2_font_10x20_tf,             20 },
-  { FONT_10X20_ALL,   "10x20 All Scripts",   u8g2_font_10x20_t_all,          20 },
-  { FONT_NCENR12,     "Serif 12",            u8g2_font_ncenr12_tf,           12 },
-  { FONT_NCENR14,     "Serif 14",            u8g2_font_ncenr14_tf,           14 },
-  { FONT_NCENR18,     "Serif 18",            u8g2_font_ncenr18_tf,           18 },
-  { FONT_HELVR12,     "Sans 12",             u8g2_font_helvR12_tf,           12 },
-  { FONT_HELVR14,     "Sans 14",             u8g2_font_helvR14_tf,           14 },
-  { FONT_HELVR18,     "Sans 18",             u8g2_font_helvR18_tf,           18 },
-  { FONT_HELVB12,     "Sans Bold 12",        u8g2_font_helvB12_tf,           12 },
-  { FONT_HELVB14,     "Sans Bold 14",        u8g2_font_helvB14_tf,           14 },
-  { FONT_HELVB18,     "Sans Bold 18",        u8g2_font_helvB18_tf,           18 },
-  { FONT_LOGISOSO28,  "Logisoso 28",         u8g2_font_logisoso28_tf,        28 },
-  { FONT_LOGISOSO32,  "Logisoso 32",         u8g2_font_logisoso32_tf,        32 },
-  { FONT_LOGISOSO42,  "Logisoso 42",         u8g2_font_logisoso42_tf,        42 },
-  { FONT_UNIFONT,     "Unifont (Unicode)",   u8g2_font_unifont_t_unifont,    16 },
-  { FONT_CYRILLIC_S,  "5x7 Cyrillic",        u8g2_font_5x7_t_cyrillic,       7  },
-  { FONT_CYRILLIC_L,  "9x15 Cyrillic",       u8g2_font_9x15_t_cyrillic,      15 },
+  { FONT_5X7,        "5x7",              u8g2_font_5x7_tf,             7  },
+  { FONT_6X10,       "6x10",             u8g2_font_6x10_tf,            10 },
+  { FONT_7X13,       "7x13",             u8g2_font_7x13_tf,            13 },
+  { FONT_7X13B,      "7x13 Bold",        u8g2_font_7x13B_tf,           13 },
+  { FONT_8X13,       "8x13",             u8g2_font_8x13_tf,            13 },
+  { FONT_8X13B,      "8x13 Bold",        u8g2_font_8x13B_tf,           13 },
+  { FONT_9X15,       "9x15",             u8g2_font_9x15_tf,            15 },
+  { FONT_9X15B,      "9x15 Bold",        u8g2_font_9x15B_tf,           15 },
+  { FONT_10X20,      "10x20",            u8g2_font_10x20_tf,           20 },
+  { FONT_NCENR12,    "Serif 12",         u8g2_font_ncenr12_tf,         12 },
+  { FONT_NCENR14,    "Serif 14",         u8g2_font_ncenr14_tf,         14 },
+  { FONT_NCENR18,    "Serif 18",         u8g2_font_ncenr18_tf,         18 },
+  { FONT_HELVR12,    "Sans 12",          u8g2_font_helvR12_tf,         12 },
+  { FONT_HELVR14,    "Sans 14",          u8g2_font_helvR14_tf,         14 },
+  { FONT_HELVR18,    "Sans 18",          u8g2_font_helvR18_tf,         18 },
+  { FONT_HELVB12,    "Sans Bold 12",     u8g2_font_helvB12_tf,         12 },
+  { FONT_HELVB14,    "Sans Bold 14",     u8g2_font_helvB14_tf,         14 },
+  { FONT_HELVB18,    "Sans Bold 18",     u8g2_font_helvB18_tf,         18 },
+  { FONT_LOGISOSO28, "Logisoso 28",      u8g2_font_logisoso28_tf,      28 },
+  { FONT_LOGISOSO32, "Logisoso 32",      u8g2_font_logisoso32_tf,      32 },
+  { FONT_LOGISOSO42, "Logisoso 42",      u8g2_font_logisoso42_tf,      42 },
+  { FONT_UNIFONT,    "Unifont (Unicode)",u8g2_font_unifont_t_unifont,  16 },
+  { FONT_CYRILLIC_S, "5x7 Cyrillic",    u8g2_font_5x7_t_cyrillic,     7  },
+  { FONT_CYRILLIC_L, "9x15 Cyrillic",   u8g2_font_9x15_t_cyrillic,    15 },
 };
 const int FONT_TABLE_SIZE = sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]);
 
 const FontEntry* getFontEntry(uint8_t id) {
   for (int i = 0; i < FONT_TABLE_SIZE; i++)
     if (FONT_TABLE[i].id == id) return &FONT_TABLE[i];
-  return &FONT_TABLE[5]; // fallback: 7x13 All Scripts
+  return &FONT_TABLE[2]; // fallback: 7x13
 }
 
 // ========== STRUCTS ==========
@@ -139,21 +133,21 @@ void initDefaults() {
   twitchCfg.subs.msg[1] = "{user}!";
   twitchCfg.subs.msg[2] = "";
   for(int i=0;i<3;i++){
-    twitchCfg.subs.font[i]=FONT_7X13_ALL; twitchCfg.subs.align[i]=1;
+    twitchCfg.subs.font[i]=FONT_7X13; twitchCfg.subs.align[i]=1;
     twitchCfg.subs.bold[i]=true; twitchCfg.subs.invert[i]=false;
   }
   twitchCfg.bits.msg[0] = "CHEER:";
   twitchCfg.bits.msg[1] = "{user}";
   twitchCfg.bits.msg[2] = "{amount} bits";
   for(int i=0;i<3;i++){
-    twitchCfg.bits.font[i]=FONT_7X13_ALL; twitchCfg.bits.align[i]=1;
+    twitchCfg.bits.font[i]=FONT_7X13; twitchCfg.bits.align[i]=1;
     twitchCfg.bits.bold[i]=true; twitchCfg.bits.invert[i]=false;
   }
   twitchCfg.points.msg[0] = "REDEEM:";
   twitchCfg.points.msg[1] = "{user}";
   twitchCfg.points.msg[2] = "{reward}";
   for(int i=0;i<3;i++){
-    twitchCfg.points.font[i]=FONT_7X13_ALL; twitchCfg.points.align[i]=1;
+    twitchCfg.points.font[i]=FONT_7X13; twitchCfg.points.align[i]=1;
     twitchCfg.points.bold[i]=true; twitchCfg.points.invert[i]=false;
   }
   twitchCfg.raids.msg[0] = "RAID!";
@@ -634,7 +628,7 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 
 <div class="card">
   <h2>Manual Test Print</h2>
-  <textarea id="t_txt">Hello! Cafe resume naive Привет</textarea>
+  <textarea id="t_txt">Hello! Café résumé naïve Привет</textarea>
   <div class="line-row" style="margin-top:6px">
     <div class="ctl font-ctl">
       <select id="t_s"></select>
@@ -655,14 +649,13 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 
 <script>
 const FONTS = [
-  [0,"5x7 Latin"],[1,"5x7 All Scripts"],[2,"6x10 Latin"],[3,"6x10 All Scripts"],
-  [4,"7x13 Latin"],[5,"7x13 All Scripts"],[6,"8x13 Latin"],[7,"8x13 All Scripts"],
-  [8,"9x15 Latin"],[9,"9x15 All Scripts"],[10,"10x20 Latin"],[11,"10x20 All Scripts"],
-  [12,"Serif 12"],[13,"Serif 14"],[14,"Serif 18"],
-  [15,"Sans 12"],[16,"Sans 14"],[17,"Sans 18"],
-  [18,"Sans Bold 12"],[19,"Sans Bold 14"],[20,"Sans Bold 18"],
-  [21,"Logisoso 28"],[22,"Logisoso 32"],[23,"Logisoso 42"],
-  [24,"Unifont (Unicode)"],[25,"5x7 Cyrillic"],[26,"9x15 Cyrillic"]
+  [0,"5x7"],[1,"6x10"],[2,"7x13"],[3,"7x13 Bold"],
+  [4,"8x13"],[5,"8x13 Bold"],[6,"9x15"],[7,"9x15 Bold"],[8,"10x20"],
+  [9,"Serif 12"],[10,"Serif 14"],[11,"Serif 18"],
+  [12,"Sans 12"],[13,"Sans 14"],[14,"Sans 18"],
+  [15,"Sans Bold 12"],[16,"Sans Bold 14"],[17,"Sans Bold 18"],
+  [18,"Logisoso 28"],[19,"Logisoso 32"],[20,"Logisoso 42"],
+  [21,"Unifont (Unicode)"],[22,"5x7 Cyrillic"],[23,"9x15 Cyrillic"]
 ];
 
 const evts   = ['sub','bit','pts','raid'];
@@ -688,7 +681,7 @@ function render() {
         <span class="line-num">${l+1}</span>
         <input type="text" id="${k}${l}_m" placeholder="Line ${l+1} ({user} {amount} {reward})">
         <div class="ctl font-ctl">
-          <select id="${k}${l}_s">${fontOpts(5)}</select>
+          <select id="${k}${l}_s">${fontOpts(2)}</select>
           <span class="tiny-lbl">Font</span>
         </div>
         <div class="ctl align-ctl">
@@ -710,7 +703,7 @@ function render() {
     h += `</div>`;
   });
   document.getElementById('cfg').innerHTML = h;
-  document.getElementById('t_s').innerHTML = fontOpts(5);
+  document.getElementById('t_s').innerHTML = fontOpts(2);
 }
 
 function load() {
@@ -827,7 +820,7 @@ void handleDisconnect() { disconnectPrinter(); server.send(200,"text/plain","Dis
 void handlePrint() {
   if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
   String text = sanitizeText(server.arg("txt"));
-  uint8_t fontId = server.hasArg("sz") ? (uint8_t)server.arg("sz").toInt() : FONT_7X13_ALL;
+  uint8_t fontId = server.hasArg("sz") ? (uint8_t)server.arg("sz").toInt() : FONT_7X13;
   int  al  = server.hasArg("al")  ? server.arg("al").toInt()   : 1;
   bool b   = server.hasArg("b")   ? (server.arg("b")  =="1")   : true;
   bool inv = server.hasArg("inv") ? (server.arg("inv")=="1")   : false;
