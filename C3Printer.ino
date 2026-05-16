@@ -44,13 +44,15 @@ const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 //       variant. Use _tf for extended Latin. For full Unicode use Unifont.
 //
 // X11 serif/sans families (ncenR, helvR, helvB) only ship certain sizes in U8g2:
-//   ncenR:  08, 10, 12, 14, 18, 24  — BUT ncenR12 is absent; nearest are 10 and 14
-//   helvR:  08, 10, 12, 14, 18, 24  — BUT helvR12 is absent; nearest are 10 and 14
+//   ncenR:  08, 10, 14, 24  — sizes 12 and 18 are absent
+//   helvR:  08, 10, 14, 24  — sizes 12 and 18 are absent
 //   helvB:  08, 10, 12, 14, 18, 24
-// Sizes 12 and 18 are MISSING for ncenR and helvR (the library skips them).
 // We map:  "Serif 12" -> ncenR14,  "Serif 18" -> ncenR24
 //          "Sans 12"  -> helvR14,  "Sans 18"  -> helvR24
-//          "Sans Bold 12" -> helvB12, "Sans Bold 18" -> helvB18 (these DO exist)
+//          "Sans Bold 12/18" -> helvB12/helvB18 (these DO exist)
+//
+// Unifont: correct name is u8g2_font_unifont_tf (full 16px Unicode bitmap font).
+// The _t_unifont suffix does not exist in the library.
 
 struct FontEntry {
   uint8_t     id;
@@ -94,19 +96,19 @@ const FontEntry FONT_TABLE[] = {
   { FONT_9X15,       "9x15",             u8g2_font_9x15_tf,            15 },
   { FONT_9X15B,      "9x15 Bold",        u8g2_font_9x15B_tf,           15 },
   { FONT_10X20,      "10x20",            u8g2_font_10x20_tf,           20 },
-  { FONT_NCENR12,    "Serif 14",         u8g2_font_ncenR14_tf,         14 },  // ncenR12 missing in U8g2; use 14
+  { FONT_NCENR12,    "Serif 14",         u8g2_font_ncenR14_tf,         14 },  // ncenR12 missing; use 14
   { FONT_NCENR14,    "Serif 14",         u8g2_font_ncenR14_tf,         14 },
-  { FONT_NCENR18,    "Serif 24",         u8g2_font_ncenR24_tf,         24 },  // ncenR18 missing in U8g2; use 24
-  { FONT_HELVR12,    "Sans 14",          u8g2_font_helvR14_tf,         14 },  // helvR12 missing in U8g2; use 14
+  { FONT_NCENR18,    "Serif 24",         u8g2_font_ncenR24_tf,         24 },  // ncenR18 missing; use 24
+  { FONT_HELVR12,    "Sans 14",          u8g2_font_helvR14_tf,         14 },  // helvR12 missing; use 14
   { FONT_HELVR14,    "Sans 14",          u8g2_font_helvR14_tf,         14 },
-  { FONT_HELVR18,    "Sans 24",          u8g2_font_helvR24_tf,         24 },  // helvR18 missing in U8g2; use 24
+  { FONT_HELVR18,    "Sans 24",          u8g2_font_helvR24_tf,         24 },  // helvR18 missing; use 24
   { FONT_HELVB12,    "Sans Bold 12",     u8g2_font_helvB12_tf,         12 },
   { FONT_HELVB14,    "Sans Bold 14",     u8g2_font_helvB14_tf,         14 },
   { FONT_HELVB18,    "Sans Bold 18",     u8g2_font_helvB18_tf,         18 },
   { FONT_LOGISOSO28, "Logisoso 28",      u8g2_font_logisoso28_tf,      28 },
   { FONT_LOGISOSO32, "Logisoso 32",      u8g2_font_logisoso32_tf,      32 },
   { FONT_LOGISOSO42, "Logisoso 42",      u8g2_font_logisoso42_tf,      42 },
-  { FONT_UNIFONT,    "Unifont (Unicode)",u8g2_font_unifont_t_unifont,  16 },
+  { FONT_UNIFONT,    "Unifont (Unicode)", u8g2_font_unifont_tf,         16 },  // was _t_unifont (invalid)
   { FONT_CYRILLIC_S, "5x7 Cyrillic",    u8g2_font_5x7_t_cyrillic,     7  },
   { FONT_CYRILLIC_L, "9x15 Cyrillic",   u8g2_font_9x15_t_cyrillic,    15 },
 };
@@ -573,7 +575,7 @@ void saveConfig() {
   saveEvent("sub",  twitchCfg.subs);
   saveEvent("bit",  twitchCfg.bits);
   saveEvent("pts",  twitchCfg.points);
-  saveEvent("raid", twitchCfg.raids);
+  saveEvent("raid\", twitchCfg.raids);
   preferences.putString("pts_filter", pointsRewardFilter);
   preferences.end();
   Serial.println("Config saved");
