@@ -42,6 +42,15 @@ const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 // _tr  = transparent, ASCII 32-127 only
 // Note: the X11 monospace fonts (5x7, 6x10, 7x13, etc.) do NOT have a _t_all
 //       variant. Use _tf for extended Latin. For full Unicode use Unifont.
+//
+// X11 serif/sans families (ncenR, helvR, helvB) only ship certain sizes in U8g2:
+//   ncenR:  08, 10, 12, 14, 18, 24  — BUT ncenR12 is absent; nearest are 10 and 14
+//   helvR:  08, 10, 12, 14, 18, 24  — BUT helvR12 is absent; nearest are 10 and 14
+//   helvB:  08, 10, 12, 14, 18, 24
+// Sizes 12 and 18 are MISSING for ncenR and helvR (the library skips them).
+// We map:  "Serif 12" -> ncenR14,  "Serif 18" -> ncenR24
+//          "Sans 12"  -> helvR14,  "Sans 18"  -> helvR24
+//          "Sans Bold 12" -> helvB12, "Sans Bold 18" -> helvB18 (these DO exist)
 
 struct FontEntry {
   uint8_t     id;
@@ -85,12 +94,12 @@ const FontEntry FONT_TABLE[] = {
   { FONT_9X15,       "9x15",             u8g2_font_9x15_tf,            15 },
   { FONT_9X15B,      "9x15 Bold",        u8g2_font_9x15B_tf,           15 },
   { FONT_10X20,      "10x20",            u8g2_font_10x20_tf,           20 },
-  { FONT_NCENR12,    "Serif 12",         u8g2_font_ncenr12_tf,         12 },
-  { FONT_NCENR14,    "Serif 14",         u8g2_font_ncenr14_tf,         14 },
-  { FONT_NCENR18,    "Serif 18",         u8g2_font_ncenr18_tf,         18 },
-  { FONT_HELVR12,    "Sans 12",          u8g2_font_helvR12_tf,         12 },
+  { FONT_NCENR12,    "Serif 14",         u8g2_font_ncenR14_tf,         14 },  // ncenR12 missing in U8g2; use 14
+  { FONT_NCENR14,    "Serif 14",         u8g2_font_ncenR14_tf,         14 },
+  { FONT_NCENR18,    "Serif 24",         u8g2_font_ncenR24_tf,         24 },  // ncenR18 missing in U8g2; use 24
+  { FONT_HELVR12,    "Sans 14",          u8g2_font_helvR14_tf,         14 },  // helvR12 missing in U8g2; use 14
   { FONT_HELVR14,    "Sans 14",          u8g2_font_helvR14_tf,         14 },
-  { FONT_HELVR18,    "Sans 18",          u8g2_font_helvR18_tf,         18 },
+  { FONT_HELVR18,    "Sans 24",          u8g2_font_helvR24_tf,         24 },  // helvR18 missing in U8g2; use 24
   { FONT_HELVB12,    "Sans Bold 12",     u8g2_font_helvB12_tf,         12 },
   { FONT_HELVB14,    "Sans Bold 14",     u8g2_font_helvB14_tf,         14 },
   { FONT_HELVB18,    "Sans Bold 18",     u8g2_font_helvB18_tf,         18 },
@@ -651,8 +660,8 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 const FONTS = [
   [0,"5x7"],[1,"6x10"],[2,"7x13"],[3,"7x13 Bold"],
   [4,"8x13"],[5,"8x13 Bold"],[6,"9x15"],[7,"9x15 Bold"],[8,"10x20"],
-  [9,"Serif 12"],[10,"Serif 14"],[11,"Serif 18"],
-  [12,"Sans 12"],[13,"Sans 14"],[14,"Sans 18"],
+  [9,"Serif 14"],[10,"Serif 14"],[11,"Serif 24"],
+  [12,"Sans 14"],[13,"Sans 14"],[14,"Sans 24"],
   [15,"Sans Bold 12"],[16,"Sans Bold 14"],[17,"Sans Bold 18"],
   [18,"Logisoso 28"],[19,"Logisoso 32"],[20,"Logisoso 42"],
   [21,"Unifont (Unicode)"],[22,"5x7 Cyrillic"],[23,"9x15 Cyrillic"]
