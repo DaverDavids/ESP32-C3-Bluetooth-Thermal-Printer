@@ -8,6 +8,7 @@
 #include <BLEUtils.h>
 #include <BLEClient.h>
 #include <Adafruit_GFX.h>
+#include <U8g2_for_Adafruit_GFX.h>
 #include <Secrets.h>
 
 const char* hostname = "c3printer";
@@ -28,20 +29,101 @@ bool printerConnected = false;
 bool twitchConnected = false;
 unsigned long lastTwitchPing = 0;
 
-String pointsRewardFilter = "";  // Empty = trigger on ALL redemptions
-
+String pointsRewardFilter = "";
 bool shouldSaveConfig = false;
-const int PRINTER_WIDTH = 400; // dots
-const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8; // 48 bytes
+
+const int PRINTER_WIDTH = 400;
+const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
+
+// ========== U8G2 FONT TABLE ==========
+// Font IDs stored in EventConfig.font[] and in Preferences (key _s).
+// "All Scripts" variants cover Latin, Latin Extended, Cyrillic, Greek,
+// and many misc Unicode symbols via the u8g2 _t_all suffix.
+// Unifont covers ~50k Unicode codepoints.
+
+struct FontEntry {
+  uint8_t id;
+  const char* label;
+  const uint8_t* font;
+  uint8_t charW;   // approx pixel width per char (for word-wrap)
+  uint8_t charH;   // approx pixel height (for line spacing)
+};
+
+#define FONT_5X7_LATIN    0
+#define FONT_5X7_ALL      1
+#define FONT_6X10_LATIN   2
+#define FONT_6X10_ALL     3
+#define FONT_7X13_LATIN   4
+#define FONT_7X13_ALL     5
+#define FONT_8X13_LATIN   6
+#define FONT_8X13_ALL     7
+#define FONT_9X15_LATIN   8
+#define FONT_9X15_ALL     9
+#define FONT_10X20_LATIN  10
+#define FONT_10X20_ALL    11
+#define FONT_NCENR12      12
+#define FONT_NCENR14      13
+#define FONT_NCENR18      14
+#define FONT_HELVR12      15
+#define FONT_HELVR14      16
+#define FONT_HELVR18      17
+#define FONT_HELVB12      18
+#define FONT_HELVB14      19
+#define FONT_HELVB18      20
+#define FONT_LOGISOSO28   21
+#define FONT_LOGISOSO32   22
+#define FONT_LOGISOSO42   23
+#define FONT_UNIFONT_ALL  24
+#define FONT_CYRILLIC_S   25
+#define FONT_CYRILLIC_L   26
+
+const FontEntry FONT_TABLE[] = {
+  { FONT_5X7_LATIN,   "5x7 Latin",          u8g2_font_5x7_tf,                        5,  7 },
+  { FONT_5X7_ALL,     "5x7 All Scripts",    u8g2_font_5x7_t_all,                     5,  7 },
+  { FONT_6X10_LATIN,  "6x10 Latin",         u8g2_font_6x10_tf,                       6, 10 },
+  { FONT_6X10_ALL,    "6x10 All Scripts",   u8g2_font_6x10_t_all,                    6, 10 },
+  { FONT_7X13_LATIN,  "7x13 Latin",         u8g2_font_7x13_tf,                       7, 13 },
+  { FONT_7X13_ALL,    "7x13 All Scripts",   u8g2_font_7x13_t_all,                    7, 13 },
+  { FONT_8X13_LATIN,  "8x13 Latin",         u8g2_font_8x13_tf,                       8, 13 },
+  { FONT_8X13_ALL,    "8x13 All Scripts",   u8g2_font_8x13_t_all,                    8, 13 },
+  { FONT_9X15_LATIN,  "9x15 Latin",         u8g2_font_9x15_tf,                       9, 15 },
+  { FONT_9X15_ALL,    "9x15 All Scripts",   u8g2_font_9x15_t_all,                    9, 15 },
+  { FONT_10X20_LATIN, "10x20 Latin",        u8g2_font_10x20_tf,                     10, 20 },
+  { FONT_10X20_ALL,   "10x20 All Scripts",  u8g2_font_10x20_t_all,                  10, 20 },
+  { FONT_NCENR12,     "Serif 12",           u8g2_font_ncenr12_tf,                    7, 12 },
+  { FONT_NCENR14,     "Serif 14",           u8g2_font_ncenr14_tf,                    8, 14 },
+  { FONT_NCENR18,     "Serif 18",           u8g2_font_ncenr18_tf,                   10, 18 },
+  { FONT_HELVR12,     "Sans 12",            u8g2_font_helvR12_tf,                    7, 12 },
+  { FONT_HELVR14,     "Sans 14",            u8g2_font_helvR14_tf,                    8, 14 },
+  { FONT_HELVR18,     "Sans 18",            u8g2_font_helvR18_tf,                   10, 18 },
+  { FONT_HELVB12,     "Sans Bold 12",       u8g2_font_helvB12_tf,                    7, 12 },
+  { FONT_HELVB14,     "Sans Bold 14",       u8g2_font_helvB14_tf,                    8, 14 },
+  { FONT_HELVB18,     "Sans Bold 18",       u8g2_font_helvB18_tf,                   10, 18 },
+  { FONT_LOGISOSO28,  "Logisoso 28",        u8g2_font_logisoso28_tf,                16, 28 },
+  { FONT_LOGISOSO32,  "Logisoso 32",        u8g2_font_logisoso32_tf,                18, 32 },
+  { FONT_LOGISOSO42,  "Logisoso 42",        u8g2_font_logisoso42_tf,                24, 42 },
+  { FONT_UNIFONT_ALL, "Unifont (All Unicode)",u8g2_font_unifont_t_latin_extended,   12, 16 },
+  { FONT_CYRILLIC_S,  "5x7 Cyrillic",       u8g2_font_5x7_t_cyrillic,               5,  7 },
+  { FONT_CYRILLIC_L,  "9x15 Cyrillic",      u8g2_font_9x15_t_cyrillic,              9, 15 },
+};
+const int FONT_TABLE_SIZE = sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]);
+
+const FontEntry* getFontEntry(uint8_t id) {
+  for (int i = 0; i < FONT_TABLE_SIZE; i++)
+    if (FONT_TABLE[i].id == id) return &FONT_TABLE[i];
+  return &FONT_TABLE[1]; // fallback: 5x7 All Scripts
+}
+
+// ========== STRUCTS ==========
 
 struct EventConfig {
-  bool enabled = true;
-  String msg[3];
-  int size[3];
-  int align[3];
-  bool bold[3];
-  bool invert[3];
-  int feed = 3;
+  bool    enabled = true;
+  String  msg[3];
+  uint8_t font[3];    // font ID from FONT_TABLE
+  int     align[3];
+  bool    bold[3];
+  bool    invert[3];
+  int     feed = 3;
 };
 
 struct TwitchConfig {
@@ -55,33 +137,30 @@ void initDefaults() {
   twitchCfg.subs.msg[0] = "NEW SUB:";
   twitchCfg.subs.msg[1] = "{user}!";
   twitchCfg.subs.msg[2] = "";
-  for(int i=0; i<3; i++) {
-    twitchCfg.subs.size[i] = 3; twitchCfg.subs.align[i] = 1;
-    twitchCfg.subs.bold[i] = true; twitchCfg.subs.invert[i] = false;
+  for(int i=0;i<3;i++){
+    twitchCfg.subs.font[i]=FONT_7X13_ALL; twitchCfg.subs.align[i]=1;
+    twitchCfg.subs.bold[i]=true; twitchCfg.subs.invert[i]=false;
   }
-
   twitchCfg.bits.msg[0] = "CHEER:";
   twitchCfg.bits.msg[1] = "{user}";
   twitchCfg.bits.msg[2] = "{amount} bits";
-  for(int i=0; i<3; i++) {
-    twitchCfg.bits.size[i] = 3; twitchCfg.bits.align[i] = 1;
-    twitchCfg.bits.bold[i] = true; twitchCfg.bits.invert[i] = false;
+  for(int i=0;i<3;i++){
+    twitchCfg.bits.font[i]=FONT_7X13_ALL; twitchCfg.bits.align[i]=1;
+    twitchCfg.bits.bold[i]=true; twitchCfg.bits.invert[i]=false;
   }
-
   twitchCfg.points.msg[0] = "REDEEM:";
   twitchCfg.points.msg[1] = "{user}";
   twitchCfg.points.msg[2] = "{reward}";
-  for(int i=0; i<3; i++) {
-    twitchCfg.points.size[i] = 3; twitchCfg.points.align[i] = 1;
-    twitchCfg.points.bold[i] = true; twitchCfg.points.invert[i] = false;
+  for(int i=0;i<3;i++){
+    twitchCfg.points.font[i]=FONT_7X13_ALL; twitchCfg.points.align[i]=1;
+    twitchCfg.points.bold[i]=true; twitchCfg.points.invert[i]=false;
   }
-
-  twitchCfg.raids.msg[0] = "\xF0\x9F\x9A\xA8 RAID \xF0\x9F\x9A\xA8";
+  twitchCfg.raids.msg[0] = "RAID!";
   twitchCfg.raids.msg[1] = "from";
   twitchCfg.raids.msg[2] = "{user}";
-  for(int i=0; i<3; i++) {
-    twitchCfg.raids.size[i] = 4; twitchCfg.raids.align[i] = 1;
-    twitchCfg.raids.bold[i] = true; twitchCfg.raids.invert[i] = false;
+  for(int i=0;i<3;i++){
+    twitchCfg.raids.font[i]=FONT_LOGISOSO28; twitchCfg.raids.align[i]=1;
+    twitchCfg.raids.bold[i]=false; twitchCfg.raids.invert[i]=false;
   }
 }
 
@@ -97,22 +176,16 @@ public:
     buffer = (uint8_t*)malloc(bufferSize);
     if(buffer) memset(buffer, 0, bufferSize);
   }
-
-  ~PrintCanvas() {
-    if(buffer) free(buffer);
-  }
+  ~PrintCanvas() { if(buffer) free(buffer); }
 
   void drawPixel(int16_t x, int16_t y, uint16_t color) override {
     if(!buffer || x < 0 || x >= _width || y < 0 || y >= _height) return;
     int byteIndex = (y * (_width / 8)) + (x / 8);
-    int bitIndex = 7 - (x % 8);
+    int bitIndex  = 7 - (x % 8);
     if(color) buffer[byteIndex] |=  (1 << bitIndex);
     else       buffer[byteIndex] &= ~(1 << bitIndex);
   }
-
-  void clear() {
-    if(buffer) memset(buffer, 0, bufferSize);
-  }
+  void clear() { if(buffer) memset(buffer, 0, bufferSize); }
 };
 
 // ========== TEXT PROCESSING ==========
@@ -123,48 +196,47 @@ String processNewlines(String text) {
   return text;
 }
 
-// Clean text for printing - keep printable ASCII only.
-// Multi-byte UTF-8 sequences and control characters are replaced with '?'.
+// Pass valid UTF-8 sequences through so U8g2 fonts can render them.
+// Only strips genuine control characters (except \n) and malformed bytes.
 String sanitizeText(String text) {
   String result = "";
-  int i = 0;
-  while (i < (int)text.length()) {
+  int i = 0, len = (int)text.length();
+  while (i < len) {
     unsigned char c = (unsigned char)text[i];
-
     if (c == '\n') {
-      result += '\n';
-      i++;
-    } else if (c >= 32 && c <= 126) {
-      // Plain printable ASCII - keep as-is
-      result += (char)c;
-      i++;
-    } else if (c < 32 || c == 127) {
-      // Control character - skip silently
-      i++;
-    } else if (c >= 0xF0) {
-      // 4-byte UTF-8 (emoji etc.) - replace whole sequence with '?'
-      result += '?';
-      i += 4;
-    } else if (c >= 0xE0) {
-      // 3-byte UTF-8 - replace with '?'
-      result += '?';
-      i += 3;
-    } else if (c >= 0xC0) {
-      // 2-byte UTF-8 - replace with '?'
-      result += '?';
-      i += 2;
+      result += '\n'; i++;
+    } else if (c < 0x20 || c == 0x7F) {
+      i++; // control char — skip
+    } else if (c <= 0x7E) {
+      result += (char)c; i++; // plain ASCII
+    } else if (c >= 0xF0 && c <= 0xF7) {
+      if (i+3 < len &&
+          ((unsigned char)text[i+1]&0xC0)==0x80 &&
+          ((unsigned char)text[i+2]&0xC0)==0x80 &&
+          ((unsigned char)text[i+3]&0xC0)==0x80) {
+        result+=text[i]; result+=text[i+1]; result+=text[i+2]; result+=text[i+3]; i+=4;
+      } else { i++; }
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      if (i+2 < len &&
+          ((unsigned char)text[i+1]&0xC0)==0x80 &&
+          ((unsigned char)text[i+2]&0xC0)==0x80) {
+        result+=text[i]; result+=text[i+1]; result+=text[i+2]; i+=3;
+      } else { i++; }
+    } else if (c >= 0xC0 && c <= 0xDF) {
+      if (i+1 < len && ((unsigned char)text[i+1]&0xC0)==0x80) {
+        result+=text[i]; result+=text[i+1]; i+=2;
+      } else { i++; }
     } else {
-      // Stray continuation byte - skip
-      i++;
+      i++; // lone continuation byte
     }
   }
   return result;
 }
 
-String wordWrap(String text, int maxWidth, int fontSize) {
+// Word-wrap using approximate char width from FontEntry.
+String wordWrap(String text, int maxWidth, int charW) {
   String result = "";
-  int charWidth = 6 * fontSize;
-  int maxCharsPerLine = maxWidth / charWidth;
+  int maxCharsPerLine = maxWidth / charW;
   if(maxCharsPerLine < 5) maxCharsPerLine = 5;
 
   int lineStart = 0;
@@ -178,10 +250,7 @@ String wordWrap(String text, int maxWidth, int fontSize) {
       if(lineEnd < (int)text.length()) result += "\n";
     } else {
       while(line.length() > 0) {
-        if((int)line.length() <= maxCharsPerLine) {
-          result += line;
-          break;
-        }
+        if((int)line.length() <= maxCharsPerLine) { result += line; break; }
         int breakPoint = maxCharsPerLine;
         int lastSpace = line.lastIndexOf(' ', breakPoint);
         if(lastSpace > 0) breakPoint = lastSpace;
@@ -205,15 +274,6 @@ void sendCmd(const uint8_t* cmd, size_t len) {
   delay(10);
 }
 
-void initPrinter() {
-  uint8_t init[] = {0x1B, 0x40};
-  sendCmd(init, 2);
-  delay(100);
-  uint8_t utf8[] = {0x1B, 0x74, 0x10};
-  sendCmd(utf8, 3);
-  delay(50);
-}
-
 void printBitmap(uint8_t *bitmap, int width, int height) {
   if(!printerConnected || !bitmap) return;
   int widthBytes = width / 8;
@@ -222,10 +282,8 @@ void printBitmap(uint8_t *bitmap, int width, int height) {
     (uint8_t)(widthBytes & 0xFF), (uint8_t)(widthBytes >> 8),
     (uint8_t)(height  & 0xFF),   (uint8_t)(height  >> 8)
   };
-  pWriteCharacteristic->writeValue(cmd, 8);
-  delay(10);
-  int totalBytes = widthBytes * height;
-  int chunkSize = 200;
+  pWriteCharacteristic->writeValue(cmd, 8); delay(10);
+  int totalBytes = widthBytes * height, chunkSize = 200;
   for(int i = 0; i < totalBytes; i += chunkSize) {
     int sendSize = min(chunkSize, totalBytes - i);
     pWriteCharacteristic->writeValue(&bitmap[i], sendSize);
@@ -240,51 +298,48 @@ void feedPaper(int lines) {
   }
 }
 
-bool printToThermal(String text, int textSize, int align, bool bold, bool invert, int feedLines) {
+bool printToThermal(String text, uint8_t fontId, int align, bool bold, bool invert, int feedLines) {
   if(!printerConnected) return false;
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
 
   text = processNewlines(text);
-  int fontSize = constrain(textSize, 1, 8);
+  const FontEntry* fe = getFontEntry(fontId);
+
   int maxTextWidth = PRINTER_WIDTH - 6;
-  text = wordWrap(text, maxTextWidth, fontSize);
+  text = wordWrap(text, maxTextWidth, fe->charW);
 
   int totalLines = 1;
   for(int i = 0; i < (int)text.length(); i++) if(text[i] == '\n') totalLines++;
 
-  int charHeight   = 8 * fontSize;
-  int lineSpacing  = 2 * fontSize;
-  int lineHeight   = charHeight + lineSpacing;
-  int linesPerChunk = 200 / lineHeight;
-  if(linesPerChunk < 1) linesPerChunk = 1;
+  int charHeight  = fe->charH;
+  int lineSpacing = max(2, charHeight / 6);
+  int lineHeight  = charHeight + lineSpacing;
+  int linesPerChunk = max(1, 200 / lineHeight);
 
-  int currentLineIndex = 0;
-  int textIndex = 0;
+  int currentLineIndex = 0, textIndex = 0;
 
   while(currentLineIndex < totalLines) {
-    int chunkLineCount = 0;
-    int chunkHeight = 0;
-    if(currentLineIndex == 0) chunkHeight += fontSize * 2;
-
+    int chunkLineCount = 0, chunkHeight = 0;
+    if(currentLineIndex == 0) chunkHeight += lineSpacing * 2;
     for(int i = 0; i < linesPerChunk && (currentLineIndex + i) < totalLines; i++) {
-      chunkLineCount++;
-      chunkHeight += lineHeight;
+      chunkLineCount++; chunkHeight += lineHeight;
     }
-    if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += fontSize * 2;
+    if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += lineSpacing * 2;
 
     PrintCanvas canvas(PRINTER_WIDTH, chunkHeight);
     if(!canvas.buffer) { Serial.println("Chunk alloc failed!"); return false; }
 
-    canvas.setTextSize(fontSize);
-    canvas.setTextWrap(false);
-    if(invert) {
-      canvas.fillRect(0, 0, PRINTER_WIDTH, chunkHeight, 1);
-      canvas.setTextColor(0);
-    } else {
-      canvas.setTextColor(1);
-    }
+    if(invert) canvas.fillRect(0, 0, PRINTER_WIDTH, chunkHeight, 1);
 
-    int drawY = (currentLineIndex == 0) ? fontSize : 0;
+    U8G2_FOR_ADAFRUIT_GFX u8g2;
+    u8g2.begin(canvas);
+    u8g2.setFont(fe->font);
+    u8g2.setFontMode(1);
+    u8g2.setFontDirection(0);
+    u8g2.setForegroundColor(invert ? 0 : 1);
+    u8g2.setBackgroundColor(invert ? 1 : 0);
+
+    int drawY = (currentLineIndex == 0) ? lineSpacing + charHeight : charHeight;
 
     for(int i = 0; i < chunkLineCount; i++) {
       int lineEnd = text.indexOf('\n', textIndex);
@@ -292,18 +347,14 @@ bool printToThermal(String text, int textSize, int align, bool bold, bool invert
       String line = text.substring(textIndex, lineEnd);
 
       if(line.length() > 0) {
-        int16_t x1, y1; uint16_t w, h;
-        canvas.getTextBounds(line, 0, 0, &x1, &y1, &w, &h);
+        int16_t tw = u8g2.getUTF8Width(line.c_str());
         int x = 2;
-        if(align == 1) x = (PRINTER_WIDTH - w) / 2;
-        else if(align == 2) x = PRINTER_WIDTH - w - 2;
+        if     (align == 1) x = (PRINTER_WIDTH - tw) / 2;
+        else if(align == 2) x = PRINTER_WIDTH - tw - 2;
         if(x < 2) x = 2;
-        canvas.setCursor(x, drawY);
-        canvas.print(line);
-        if(bold) {
-          canvas.setCursor(x+1, drawY); canvas.print(line);
-          if(!invert) { canvas.setCursor(x, drawY+1); canvas.print(line); }
-        }
+        u8g2.setCursor(x, drawY);
+        u8g2.print(line);
+        if(bold) { u8g2.setCursor(x + 1, drawY); u8g2.print(line); }
       }
       drawY   += lineHeight;
       textIndex = lineEnd + 1;
@@ -328,63 +379,32 @@ void printEvent(EventConfig& cfg, String username, String val1, String val2) {
     p.replace("{amount}", val1);
     p.replace("{reward}", val2);
     p = sanitizeText(p);
-    int feed = (i == 2 || cfg.msg[i+1 < 3 ? i+1 : 2].length() == 0) ? cfg.feed : 0;
-    printToThermal(p, cfg.size[i], cfg.align[i], cfg.bold[i], cfg.invert[i], feed);
+    int feed = (i == 2 || (i < 2 && cfg.msg[i+1].length() == 0)) ? cfg.feed : 0;
+    printToThermal(p, cfg.font[i], cfg.align[i], cfg.bold[i], cfg.invert[i], feed);
   }
 }
 
 // ========== TWITCH IRC PARSING ==========
 
-/**
- * Robustly extracts the chat message payload from a raw Twitch IRC line.
- *
- * Twitch IRC lines look like:
- *   @tags :nick!user@host PRIVMSG #channel :the actual message here :> :-)
- *
- * Strategy:
- *   1. Find the PRIVMSG or USERNOTICE command token.
- *   2. From there, find the '#' that starts the channel name.
- *   3. Find the ' ' space after the channel name.
- *   4. The very next character must be ':', then the message begins.
- *
- * This is the only unambiguous boundary: no matter how many colons appear
- * inside the message text (e.g. ":>", ":-)", "http://..."), they cannot
- * be mistaken for the message-start delimiter.
- */
 String extractIRCMessage(const String& line) {
-  // Step 1: find the command
   int cmdPos = line.indexOf(" PRIVMSG ");
   if (cmdPos < 0) cmdPos = line.indexOf(" USERNOTICE ");
   if (cmdPos < 0) return "";
-
-  // Step 2: find '#channel' after the command token
   int hashPos = line.indexOf('#', cmdPos);
   if (hashPos < 0) return "";
-
-  // Step 3: find the space after the channel name
   int spaceAfterChan = line.indexOf(' ', hashPos);
   if (spaceAfterChan < 0) return "";
-
-  // Step 4: the message payload begins right after that space+colon
-  // Confirm we have ' :' at this position
   if (spaceAfterChan + 1 >= (int)line.length() || line[spaceAfterChan + 1] != ':') return "";
-
-  String payload = line.substring(spaceAfterChan + 2); // skip ' :'
-  payload.replace("\r", "");  // strip any trailing carriage return
-  payload.trim();
+  String payload = line.substring(spaceAfterChan + 2);
+  payload.replace("\r", ""); payload.trim();
   return payload;
 }
 
-/**
- * Extracts a tag value from the Twitch IRC tag string.
- * e.g. extractTag(line, "display-name") returns "DaverDavid"
- */
 String extractTag(const String& line, const String& tagName) {
   String search = tagName + "=";
   int start = line.indexOf(search);
   if (start < 0) return "";
   start += search.length();
-  // Tags are semicolon-delimited; value ends at ';' or ' ' (start of non-tag section)
   int end = line.indexOf(';', start);
   int spaceEnd = line.indexOf(' ', start);
   if (end < 0 || (spaceEnd >= 0 && spaceEnd < end)) end = spaceEnd;
@@ -393,43 +413,32 @@ String extractTag(const String& line, const String& tagName) {
 }
 
 void parseTwitchMessage(String msg) {
-  if (msg.indexOf("msg-id=sub") > 0) {
-    String user = extractTag(msg, "display-name");
-    printEvent(twitchCfg.subs, user, "", "");
-  }
-  else if (msg.indexOf("bits=") > 0) {
-    String bits = extractTag(msg, "bits");
-    String user = extractTag(msg, "display-name");
-    printEvent(twitchCfg.bits, user, bits, "");
-  }
+  if      (msg.indexOf("msg-id=sub") > 0)
+    printEvent(twitchCfg.subs,   extractTag(msg,"display-name"), "", "");
+  else if (msg.indexOf("bits=") > 0)
+    printEvent(twitchCfg.bits,   extractTag(msg,"display-name"), extractTag(msg,"bits"), "");
   else if (msg.indexOf("custom-reward-id=") > 0) {
     String rewardId = extractTag(msg, "custom-reward-id");
     if (pointsRewardFilter.length() > 0 && rewardId != pointsRewardFilter) return;
-    String user   = extractTag(msg, "display-name");
-    String reward = extractIRCMessage(msg);
-    printEvent(twitchCfg.points, user, "", reward);
-  }
-  else if (msg.indexOf("msg-id=raid") > 0) {
-    String user = extractTag(msg, "display-name");
-    printEvent(twitchCfg.raids, user, "", "");
-  }
+    printEvent(twitchCfg.points, extractTag(msg,"display-name"), "", extractIRCMessage(msg));
+  } else if (msg.indexOf("msg-id=raid") > 0)
+    printEvent(twitchCfg.raids,  extractTag(msg,"display-name"), "", "");
 }
 
 void connectTwitch() {
   Serial.println("Connecting to Twitch IRC...");
   twitchClient.setInsecure();
   if(twitchClient.connect("irc.chat.twitch.tv", 6697)) {
-    Serial.println("Connected to Twitch");
     twitchClient.println("PASS " TWITCH_OAUTH_SECRET);
     twitchClient.println("NICK " TWITCH_OAUTH_NICK);
     twitchClient.println("CAP REQ :twitch.tv/tags twitch.tv/commands");
     twitchClient.println("JOIN #" TWITCH_CHANNEL);
     twitchConnected = true;
     lastTwitchPing  = millis();
-    Serial.println("Joined #" TWITCH_CHANNEL);
+    Serial.println("Twitch OK");
   } else {
-    Serial.println("Twitch connection failed");
     twitchConnected = false;
+    Serial.println("Twitch failed");
   }
 }
 
@@ -458,8 +467,8 @@ void handleTwitchIRC() {
 // ========== BLE CONNECTION ==========
 
 class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* pclient)    { Serial.println("BLE Connected"); }
-  void onDisconnect(BLEClient* pclient) { printerConnected = false; Serial.println("BLE Disconnected"); }
+  void onConnect(BLEClient* p)    { Serial.println("BLE Connected"); }
+  void onDisconnect(BLEClient* p) { printerConnected = false; Serial.println("BLE Disconnected"); }
 };
 
 bool connectPrinter() {
@@ -469,26 +478,23 @@ bool connectPrinter() {
   pClient = BLEDevice::createClient();
   pClient->setClientCallbacks(new MyClientCallback());
   if(!pClient->connect(BLEAddress(printerMAC.c_str()))) return false;
-  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
-  if(!pRemoteService) return false;
-  pWriteCharacteristic = pRemoteService->getCharacteristic(charWriteUUID);
+  BLERemoteService* svc = pClient->getService(serviceUUID);
+  if(!svc) return false;
+  pWriteCharacteristic = svc->getCharacteristic(charWriteUUID);
   if(!pWriteCharacteristic) return false;
   printerConnected = true;
   delay(500);
-  uint8_t wake[] = {0x00, 0x00, 0x00, 0x00, 0x00};
-  pWriteCharacteristic->writeValue(wake, 5);
-  delay(100);
+  uint8_t wake[] = {0x00,0x00,0x00,0x00,0x00};
+  pWriteCharacteristic->writeValue(wake, 5); delay(100);
   uint8_t init[] = {0x1B, 0x40};
-  pWriteCharacteristic->writeValue(init, 2);
-  delay(100);
+  pWriteCharacteristic->writeValue(init, 2); delay(100);
   Serial.println("Printer Ready");
   return true;
 }
 
 void disconnectPrinter() {
-  if(pClient != nullptr && printerConnected) pClient->disconnect();
+  if(pClient && printerConnected) pClient->disconnect();
   printerConnected = false;
-  Serial.println("Printer disconnected");
 }
 
 // ========== CONFIGURATION STORAGE ==========
@@ -502,7 +508,7 @@ void loadConfig() {
     for(int i = 0; i < 3; i++) {
       String p = String(prefix) + String(i);
       if(preferences.isKey((p+"_m").c_str())) evt.msg[i] = preferences.getString((p+"_m").c_str());
-      evt.size[i]   = preferences.getInt( (p+"_s").c_str(), evt.size[i]);
+      evt.font[i]   = (uint8_t)preferences.getInt((p+"_s").c_str(), (int)evt.font[i]);
       evt.align[i]  = preferences.getInt( (p+"_a").c_str(), evt.align[i]);
       evt.bold[i]   = preferences.getBool((p+"_b").c_str(), evt.bold[i]);
       evt.invert[i] = preferences.getBool((p+"_i").c_str(), evt.invert[i]);
@@ -514,23 +520,19 @@ void loadConfig() {
   loadEvent("raid", twitchCfg.raids);
   pointsRewardFilter = preferences.getString("pts_filter", "");
   preferences.end();
-  Serial.println("Configuration loaded");
+  Serial.println("Config loaded");
 }
 
 void saveConfig() {
-  Serial.println("Saving config...");
   preferences.end();
-  if(!preferences.begin("twitch", false)) {
-    Serial.println("Failed to open preferences!");
-    return;
-  }
+  if(!preferences.begin("twitch", false)) return;
   auto saveEvent = [&](const char* prefix, EventConfig& evt) {
     preferences.putBool((String(prefix)+"_e").c_str(), evt.enabled);
     preferences.putInt( (String(prefix)+"_f").c_str(), evt.feed);
     for(int i = 0; i < 3; i++) {
       String p = String(prefix) + String(i);
       preferences.putString((p+"_m").c_str(), evt.msg[i]);
-      preferences.putInt(   (p+"_s").c_str(), evt.size[i]);
+      preferences.putInt(   (p+"_s").c_str(), (int)evt.font[i]);
       preferences.putInt(   (p+"_a").c_str(), evt.align[i]);
       preferences.putBool(  (p+"_b").c_str(), evt.bold[i]);
       preferences.putBool(  (p+"_i").c_str(), evt.invert[i]);
@@ -543,179 +545,219 @@ void saveConfig() {
   saveEvent("raid", twitchCfg.raids);
   preferences.putString("pts_filter", pointsRewardFilter);
   preferences.end();
-  Serial.println("Configuration saved successfully");
+  Serial.println("Config saved");
 }
 
 // ========== WEB SERVER ==========
 
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
-<html><head><title>ESP32 Printer</title>
+<html lang="en"><head><title>C3 Printer</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:sans-serif;max-width:600px;margin:0 auto;padding:10px;background:#f4f4f4}
-.card{background:#fff;padding:10px;margin-bottom:10px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}
-h2{margin:0 0 10px;font-size:16px;border-bottom:2px solid #eee;padding-bottom:5px;color:#333}
-.stat{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;margin-right:5px;display:inline-block}
-.ok{background:#d4edda;color:#155724}.err{background:#f8d7da;color:#721c24}
-input,select{box-sizing:border-box;border:1px solid #ccc;border-radius:3px}
-input[type=text]{padding:4px;font-size:13px;width:100%}
-.line-row{display:flex;gap:4px;align-items:center;margin-bottom:4px;background:#f9f9f9;padding:4px;border-radius:3px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;padding:10px;max-width:640px;margin:0 auto}
+h1{font-size:18px;color:#a78bfa;padding:10px 0 6px;text-align:center;letter-spacing:1px}
+.card{background:#16213e;border:1px solid #2d2d5a;border-radius:8px;padding:10px;margin-bottom:10px}
+h2{font-size:13px;color:#7c86c9;border-bottom:1px solid #2d2d5a;padding-bottom:5px;margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
+.stat{padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold;display:inline-block;margin-right:6px}
+.ok{background:#1a3a2a;color:#4ade80;border:1px solid #166534}
+.err{background:#3a1a1a;color:#f87171;border:1px solid #7f1d1d}
+input[type=text],input[type=number],select,textarea{
+  background:#0f0f23;color:#e0e0e0;border:1px solid #3d3d6b;border-radius:4px;padding:4px 6px;font-size:12px;width:100%}
+input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#a78bfa}
+.line-row{display:flex;gap:4px;align-items:center;margin-bottom:5px;background:#0f0f23;padding:5px;border-radius:5px;border:1px solid #2d2d5a}
 .line-row input[type=text]{flex:1;min-width:0}
-.ctl{display:flex;flex-direction:column;align-items:center;justify-content:center;width:40px}
-.ctl select{width:100%;font-size:11px}
-.ctl input[type=checkbox]{margin:0}
-.tiny-lbl{font-size:9px;color:#666;margin-top:1px}
-.sec{margin-bottom:15px}
-button{width:100%;padding:10px;background:#007bff;color:#fff;border:none;border-radius:4px;margin-top:5px;cursor:pointer;font-weight:bold}
-button:active{opacity:0.8}
-button.save{background:#28a745}
-button.test{background:#17a2b8;width:auto;float:right;padding:5px 10px;margin:0;font-size:12px}
-textarea{width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:3px;padding:5px;font-family:monospace}
+.ctl{display:flex;flex-direction:column;align-items:center;gap:2px;flex-shrink:0}
+.ctl.font-ctl{width:130px}
+.ctl.align-ctl{width:50px}
+.ctl.check-ctl{width:32px}
+.tiny-lbl{font-size:9px;color:#7c86c9;white-space:nowrap;text-align:center}
+.line-num{font-size:10px;color:#555;width:12px;text-align:center;flex-shrink:0}
+button{padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;font-weight:bold;color:#fff;width:100%;margin-top:6px}
+button.save{background:#6d28d9}
+button.test{background:#0e7490;width:auto;padding:4px 10px;font-size:11px;margin-top:0;float:right}
+button.connect{background:#065f46}
+button.feed-btn{background:#374151}
+button.print-btn{background:#1d4ed8}
+.feed-row{display:flex;gap:6px;margin-top:5px}
+.feed-row button{flex:1}
+.section-footer{display:flex;align-items:center;justify-content:space-between;margin-top:6px;font-size:12px;color:#9ca3af}
+.section-footer input[type=number]{width:44px;text-align:center}
+label.en-lbl{display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;color:#a78bfa;float:right}
+.pts-filter{margin-top:8px;font-size:12px;color:#9ca3af}
+textarea{height:56px;resize:vertical;font-family:monospace}
 </style></head>
 <body>
+<h1>&#127381; C3 Printer</h1>
+
 <div class="card">
   <h2>Status</h2>
-  <div id="ps" class="stat err">Printer</div> <div id="ts" class="stat err">Twitch</div>
+  <div id="ps" class="stat err">Printer: --</div>
+  <div id="ts" class="stat err">Twitch: --</div>
+  <button class="connect" onclick="doConnect()" style="margin-top:8px">Connect Printer</button>
 </div>
 
 <div id="cfg"></div>
 
 <div class="card">
-  <button class="save" onclick="save()">&#128190; Save Configuration</button>
+  <button class="save" onclick="save()">&#128190; Save All Configuration</button>
 </div>
 
 <div class="card">
   <h2>Manual Test Print</h2>
-  <textarea id="t_txt" rows="2">Test Print</textarea>
-  <div class="line-row">
-    <div class="ctl" style="width:auto;flex:1"><span class="tiny-lbl">Settings applied to full text</span></div>
-    <div class="ctl"><select id="t_sz"></select><span class="tiny-lbl">Size</span></div>
-    <div class="ctl">
-      <select id="t_al"><option value="0">L</option><option value="1" selected>C</option><option value="2">R</option></select>
+  <textarea id="t_txt">Hello! Cafe resume naive Priviet</textarea>
+  <div class="line-row" style="margin-top:6px">
+    <div class="ctl font-ctl">
+      <select id="t_s"></select>
+      <span class="tiny-lbl">Font</span>
+    </div>
+    <div class="ctl align-ctl">
+      <select id="t_al"><option value="0">Left</option><option value="1" selected>Center</option><option value="2">Right</option></select>
       <span class="tiny-lbl">Align</span>
     </div>
-    <div class="ctl"><input type="checkbox" id="t_b" checked><span class="tiny-lbl">Bold</span></div>
-    <div class="ctl"><input type="checkbox" id="t_i"><span class="tiny-lbl">Inv</span></div>
+    <div class="ctl check-ctl"><input type="checkbox" id="t_b" checked><span class="tiny-lbl">Bold</span></div>
+    <div class="ctl check-ctl"><input type="checkbox" id="t_i"><span class="tiny-lbl">Invert</span></div>
   </div>
-  <button onclick="print()">&#128424;&#65039; Print Test</button>
-  <button onclick="feed()" style="background:#6c757d">&#128196; Feed 3 Lines</button>
+  <div class="feed-row">
+    <button class="print-btn" onclick="testPrint()">&#128424; Print</button>
+    <button class="feed-btn" onclick="feed()">&#128196; Feed 3</button>
+  </div>
 </div>
 
 <script>
-const evts = ['sub','bit','pts','raid'];
+const FONTS = [
+  [0,"5x7 Latin"],[1,"5x7 All Scripts"],[2,"6x10 Latin"],[3,"6x10 All Scripts"],
+  [4,"7x13 Latin"],[5,"7x13 All Scripts"],[6,"8x13 Latin"],[7,"8x13 All Scripts"],
+  [8,"9x15 Latin"],[9,"9x15 All Scripts"],[10,"10x20 Latin"],[11,"10x20 All Scripts"],
+  [12,"Serif 12"],[13,"Serif 14"],[14,"Serif 18"],
+  [15,"Sans 12"],[16,"Sans 14"],[17,"Sans 18"],
+  [18,"Sans Bold 12"],[19,"Sans Bold 14"],[20,"Sans Bold 18"],
+  [21,"Logisoso 28"],[22,"Logisoso 32"],[23,"Logisoso 42"],
+  [24,"Unifont (All Unicode)"],[25,"5x7 Cyrillic"],[26,"9x15 Cyrillic"]
+];
+
+const evts   = ['sub','bit','pts','raid'];
 const titles = ['Subscriptions','Bits','Points','Raids'];
 
-function mkOpt(sel) {
-  let h=''; for(let i=1;i<=8;i++) h+=`<option value="${i}" ${i==sel?'selected':''}>${i}</option>`; return h;
+function fontOpts(sel) {
+  return FONTS.map(([id,lbl])=>`<option value="${id}"${id==sel?' selected':''}>${lbl}</option>`).join('');
+}
+
+function alignOpts(sel) {
+  return ['Left','Center','Right'].map((t,i)=>
+    `<option value="${i}"${i==sel?' selected':''}>${t}</option>`).join('');
 }
 
 function render() {
-  let h='';
+  let h = '';
   evts.forEach((k,i) => {
-    h+=`<div class="card sec"><h2>${titles[i]} <label style="float:right"><input type="checkbox" id="${k}_e"> En</label></h2>`;
-    for(let l=0; l<3; l++) {
-      h+=`<div class="line-row">
-        <span style="font-size:10px;color:#888;width:10px">${l+1}</span>
-        <input type="text" id="${k}${l}_m" placeholder="Line ${l+1}...">
-        <div class="ctl"><select id="${k}${l}_s" data-def="3"></select><span class="tiny-lbl">Size</span></div>
-        <div class="ctl"><select id="${k}${l}_a">
-          <option value="0">L</option><option value="1">C</option><option value="2">R</option>
-        </select><span class="tiny-lbl">Align</span></div>
-        <div class="ctl"><input type="checkbox" id="${k}${l}_b"><span class="tiny-lbl">Bold</span></div>
-        <div class="ctl"><input type="checkbox" id="${k}${l}_i"><span class="tiny-lbl">Inv</span></div>
+    h += `<div class="card">
+      <h2>${titles[i]}
+        <label class="en-lbl"><input type="checkbox" id="${k}_e"> Enabled</label>
+      </h2>`;
+    for(let l=0;l<3;l++) {
+      h += `<div class="line-row">
+        <span class="line-num">${l+1}</span>
+        <input type="text" id="${k}${l}_m" placeholder="Line ${l+1} ({user} {amount} {reward})">
+        <div class="ctl font-ctl">
+          <select id="${k}${l}_s">${fontOpts(5)}</select>
+          <span class="tiny-lbl">Font</span>
+        </div>
+        <div class="ctl align-ctl">
+          <select id="${k}${l}_a">${alignOpts(1)}</select>
+          <span class="tiny-lbl">Align</span>
+        </div>
+        <div class="ctl check-ctl"><input type="checkbox" id="${k}${l}_b"><span class="tiny-lbl">Bold</span></div>
+        <div class="ctl check-ctl"><input type="checkbox" id="${k}${l}_i"><span class="tiny-lbl">Inv</span></div>
       </div>`;
     }
-    h += `<div style="margin-top:5px;font-size:12px;display:flex;align-items:center;justify-content:space-between">
-      <span>Feed lines: <input type="number" id="${k}_f" style="width:40px" value="3"></span>
-      <button class="test" onclick="test('${k}')">&#129514; Test ${titles[i]}</button>
+    h += `<div class="section-footer">
+      <span>Feed lines: <input type="number" id="${k}_f" value="3" min="0" max="20"></span>
+      <button class="test" onclick="testEvt('${k}')">&#129514; Test ${titles[i]}</button>
     </div>`;
-    if(k === 'pts') {
-      h += `<div style="margin-top:6px;font-size:12px;"><label>Custom Reward ID (blank = all):<br><input type="text" id="pts_filter" style="width:100%" placeholder="Reward UUID (e.g. a1b2c3d4-e5f6-...)"></label></div>`;
+    if(k==='pts') {
+      h += `<div class="pts-filter"><label>Custom Reward ID filter (blank = all):<br>
+        <input type="text" id="pts_filter" placeholder="a1b2c3d4-e5f6-..."></label></div>`;
     }
     h += `</div>`;
   });
-
   document.getElementById('cfg').innerHTML = h;
-  document.getElementById('t_sz').innerHTML = mkOpt(3);
-  evts.forEach(k => {
-    for(let l=0;l<3;l++) document.getElementById(`${k}${l}_s`).innerHTML = mkOpt(3);
-  });
+  document.getElementById('t_s').innerHTML = fontOpts(5);
 }
 
 function load() {
   render();
-  fetch('/gcfg').then(r=>r.json()).then(d => {
-    evts.forEach(k => {
-      let el = document.getElementById(`${k}_e`); if(el) el.checked = d[`${k}_e`];
-      el = document.getElementById(`${k}_f`); if(el) el.value = d[`${k}_f`];
-      for(let l=0; l<3; l++) {
-        el = document.getElementById(`${k}${l}_m`); if(el) el.value = d[`${k}${l}_m`] || '';
-        el = document.getElementById(`${k}${l}_s`); if(el) el.value = d[`${k}${l}_s`];
-        el = document.getElementById(`${k}${l}_a`); if(el) el.value = d[`${k}${l}_a`];
-        el = document.getElementById(`${k}${l}_b`); if(el) el.checked = d[`${k}${l}_b`];
-        el = document.getElementById(`${k}${l}_i`); if(el) el.checked = d[`${k}${l}_i`];
+  fetch('/gcfg').then(r=>r.json()).then(d=>{
+    evts.forEach(k=>{
+      let el;
+      el=document.getElementById(`${k}_e`); if(el) el.checked=d[`${k}_e`];
+      el=document.getElementById(`${k}_f`); if(el) el.value=d[`${k}_f`];
+      for(let l=0;l<3;l++){
+        el=document.getElementById(`${k}${l}_m`); if(el) el.value=d[`${k}${l}_m`]||'';
+        el=document.getElementById(`${k}${l}_s`); if(el) el.value=d[`${k}${l}_s`];
+        el=document.getElementById(`${k}${l}_a`); if(el) el.value=d[`${k}${l}_a`];
+        el=document.getElementById(`${k}${l}_b`); if(el) el.checked=d[`${k}${l}_b`];
+        el=document.getElementById(`${k}${l}_i`); if(el) el.checked=d[`${k}${l}_i`];
       }
     });
-    el = document.getElementById('pts_filter');
-    if(el) el.value = d.pts_filter || '';
-  }).catch(e=>{});
+    el=document.getElementById('pts_filter'); if(el) el.value=d.pts_filter||'';
+  }).catch(()=>{});
 }
 
 function save() {
-  try {
-    let params = new URLSearchParams();
-    evts.forEach(k => {
-      params.append(`${k}_e`, document.getElementById(`${k}_e`).checked?1:0);
-      params.append(`${k}_f`, document.getElementById(`${k}_f`).value);
-      for(let l=0; l<3; l++) {
-        params.append(`${k}${l}_m`, document.getElementById(`${k}${l}_m`).value);
-        params.append(`${k}${l}_s`, document.getElementById(`${k}${l}_s`).value);
-        params.append(`${k}${l}_a`, document.getElementById(`${k}${l}_a`).value);
-        params.append(`${k}${l}_b`, document.getElementById(`${k}${l}_b`).checked?1:0);
-        params.append(`${k}${l}_i`, document.getElementById(`${k}${l}_i`).checked?1:0);
-      }
-    });
-    params.append('pts_filter', document.getElementById('pts_filter').value.trim());
-    fetch('/tcfg', {method:'POST', body:params})
-      .then(r=>r.text()).then(alert).catch(e=>alert("Error: "+e));
-  } catch(err) { alert(err); }
+  let p = new URLSearchParams();
+  evts.forEach(k=>{
+    p.append(`${k}_e`,document.getElementById(`${k}_e`).checked?1:0);
+    p.append(`${k}_f`,document.getElementById(`${k}_f`).value);
+    for(let l=0;l<3;l++){
+      p.append(`${k}${l}_m`,document.getElementById(`${k}${l}_m`).value);
+      p.append(`${k}${l}_s`,document.getElementById(`${k}${l}_s`).value);
+      p.append(`${k}${l}_a`,document.getElementById(`${k}${l}_a`).value);
+      p.append(`${k}${l}_b`,document.getElementById(`${k}${l}_b`).checked?1:0);
+      p.append(`${k}${l}_i`,document.getElementById(`${k}${l}_i`).checked?1:0);
+    }
+  });
+  p.append('pts_filter',document.getElementById('pts_filter').value.trim());
+  fetch('/tcfg',{method:'POST',body:p}).then(r=>r.text()).then(alert).catch(e=>alert(e));
 }
 
-function test(k) {
-  let params = new URLSearchParams();
-  params.append('type', k);
-  params.append('f', document.getElementById(`${k}_f`).value);
-  for(let l=0; l<3; l++) {
-    params.append(`m${l}`, document.getElementById(`${k}${l}_m`).value);
-    params.append(`s${l}`, document.getElementById(`${k}${l}_s`).value);
-    params.append(`a${l}`, document.getElementById(`${k}${l}_a`).value);
-    params.append(`b${l}`, document.getElementById(`${k}${l}_b`).checked?1:0);
-    params.append(`i${l}`, document.getElementById(`${k}${l}_i`).checked?1:0);
+function testEvt(k) {
+  let p = new URLSearchParams();
+  p.append('type',k);
+  p.append('f',document.getElementById(`${k}_f`).value);
+  for(let l=0;l<3;l++){
+    p.append(`m${l}`,document.getElementById(`${k}${l}_m`).value);
+    p.append(`s${l}`,document.getElementById(`${k}${l}_s`).value);
+    p.append(`a${l}`,document.getElementById(`${k}${l}_a`).value);
+    p.append(`b${l}`,document.getElementById(`${k}${l}_b`).checked?1:0);
+    p.append(`i${l}`,document.getElementById(`${k}${l}_i`).checked?1:0);
   }
-  fetch('/test_evt', {method:'POST', body:params})
-    .then(r=>r.text()).then(alert).catch(e=>alert("Error: "+e));
+  fetch('/test_evt',{method:'POST',body:p}).then(r=>r.text()).then(alert).catch(e=>alert(e));
 }
 
-function print() {
-  let params = new URLSearchParams();
-  params.append('txt', document.getElementById('t_txt').value);
-  params.append('sz',  document.getElementById('t_sz').value);
-  params.append('al',  document.getElementById('t_al').value);
-  params.append('b',   document.getElementById('t_b').checked?1:0);
-  params.append('inv', document.getElementById('t_i').checked?1:0);
-  fetch('/p', {method:'POST', body:params})
-    .then(r=>r.text()).then(alert).catch(e=>alert("Error: "+e));
+function testPrint() {
+  let p = new URLSearchParams();
+  p.append('txt',document.getElementById('t_txt').value);
+  p.append('sz', document.getElementById('t_s').value);
+  p.append('al', document.getElementById('t_al').value);
+  p.append('b',  document.getElementById('t_b').checked?1:0);
+  p.append('inv',document.getElementById('t_i').checked?1:0);
+  fetch('/p',{method:'POST',body:p}).then(r=>r.text()).then(alert).catch(e=>alert(e));
 }
 
-function feed() { fetch('/f?lines=3'); }
+function feed()      { fetch('/f?lines=3'); }
+function doConnect() { fetch('/c').then(r=>r.text()).then(alert); }
 
-setInterval(() => {
-  fetch('/s').then(r=>r.json()).then(d => {
-    document.getElementById('ps').className = 'stat ' + (d.printer ? 'ok':'err');
-    document.getElementById('ts').className = 'stat ' + (d.twitch  ? 'ok':'err');
-  }).catch(e=>{});
-}, 2000);
+setInterval(()=>{
+  fetch('/s').then(r=>r.json()).then(d=>{
+    let ps=document.getElementById('ps'),ts=document.getElementById('ts');
+    ps.className='stat '+(d.printer?'ok':'err');
+    ps.textContent='Printer: '+(d.printer?'Connected':'Offline');
+    ts.className='stat '+(d.twitch?'ok':'err');
+    ts.textContent='Twitch: '+(d.twitch?'Connected':'Offline');
+  }).catch(()=>{});
+},2000);
 
 load();
 </script></body></html>
@@ -724,107 +766,94 @@ load();
 void handleRoot()   { server.send(200, "text/html; charset=UTF-8", htmlPage); }
 
 void handleStatus() {
-  String json = "{\"printer\":" + String(printerConnected ? "true" : "false") +
-                ",\"twitch\":"+  String(twitchConnected  ? "true" : "false") + "}";
+  String json = "{\"printer\":" + String(printerConnected?"true":"false") +
+                ",\"twitch\":"  + String(twitchConnected ?"true":"false") + "}";
   server.send(200, "application/json", json);
 }
 
 void handleGetConfig() {
   String json = "{";
   auto addEvt = [&](const char* p, EventConfig& e) {
-    json += "\"" + String(p) + "_e\":" + (e.enabled ? "true" : "false") + ",";
-    json += "\"" + String(p) + "_f\":" + String(e.feed) + ",";
-    for(int i = 0; i < 3; i++) {
-      String k = String(p) + String(i);
-      json += "\"" + k + "_m\":\"" + e.msg[i]              + "\",";
-      json += "\"" + k + "_s\":"  + String(e.size[i])       + ",";
-      json += "\"" + k + "_a\":"  + String(e.align[i])      + ",";
-      json += "\"" + k + "_b\":"  + (e.bold[i]   ? "true" : "false") + ",";
-      json += "\"" + k + "_i\":"  + (e.invert[i] ? "true" : "false") + ",";
+    json += "\""+String(p)+"_e\":"+(e.enabled?"true":"false")+",";
+    json += "\""+String(p)+"_f\":"+String(e.feed)+",";
+    for(int i=0;i<3;i++){
+      String k = String(p)+String(i);
+      json += "\""+k+"_m\":\""+e.msg[i]+"\",";
+      json += "\""+k+"_s\":"+String((int)e.font[i])+",";
+      json += "\""+k+"_a\":"+String(e.align[i])+",";
+      json += "\""+k+"_b\":"+(e.bold[i]?"true":"false")+",";
+      json += "\""+k+"_i\":"+(e.invert[i]?"true":"false")+",";
     }
   };
   addEvt("sub",  twitchCfg.subs);
   addEvt("bit",  twitchCfg.bits);
   addEvt("pts",  twitchCfg.points);
   addEvt("raid", twitchCfg.raids);
-  json += "\"pts_filter\":\"" + pointsRewardFilter + "\"";
+  json += "\"pts_filter\":\""+pointsRewardFilter+"\"";
   json += "}";
   server.send(200, "application/json", json);
 }
 
-void handleConnect() {
-  if(connectPrinter()) server.send(200, "text/plain", "Connected!");
-  else                  server.send(500, "text/plain", "Connection failed");
-}
-
-void handleDisconnect() {
-  disconnectPrinter();
-  server.send(200, "text/plain", "Disconnected");
-}
+void handleConnect()    { if(connectPrinter()) server.send(200,"text/plain","Connected!"); else server.send(500,"text/plain","Failed"); }
+void handleDisconnect() { disconnectPrinter(); server.send(200,"text/plain","Disconnected"); }
 
 void handlePrint() {
-  if(!printerConnected) { server.send(400, "text/plain", "Printer not connected"); return; }
-  String text = server.arg("txt");
-  int  sz  = server.hasArg("sz")  ? server.arg("sz").toInt()        : 3;
-  int  al  = server.hasArg("al")  ? server.arg("al").toInt()        : 1;
-  bool b   = server.hasArg("b")   ? (server.arg("b")   == "1")      : true;
-  bool inv = server.hasArg("inv") ? (server.arg("inv") == "1")      : false;
-  printToThermal(text, sz, al, b, inv, 3);
-  server.send(200, "text/plain", "Printed!");
+  if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
+  String text = sanitizeText(server.arg("txt"));
+  uint8_t fontId = server.hasArg("sz") ? (uint8_t)server.arg("sz").toInt() : FONT_7X13_ALL;
+  int  al  = server.hasArg("al")  ? server.arg("al").toInt()   : 1;
+  bool b   = server.hasArg("b")   ? (server.arg("b")  =="1")   : true;
+  bool inv = server.hasArg("inv") ? (server.arg("inv")=="1")   : false;
+  printToThermal(text, fontId, al, b, inv, 3);
+  server.send(200,"text/plain","Printed!");
 }
 
 void handleFeed() {
-  if(!printerConnected) { server.send(400, "text/plain", "Not connected"); return; }
+  if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
   int lines = server.arg("lines").toInt();
   if(lines < 1) lines = 3;
   feedPaper(lines);
-  server.send(200, "text/plain", "Fed " + String(lines) + " lines");
+  server.send(200,"text/plain","Fed "+String(lines)+" lines");
 }
 
 void handleTwitchConfig() {
-  Serial.println("Receiving new config...");
   auto updEvt = [&](const char* p, EventConfig& e) {
-    if(server.hasArg(String(p)+"_e")) e.enabled = server.arg(String(p)+"_e") == "1";
+    if(server.hasArg(String(p)+"_e")) e.enabled = server.arg(String(p)+"_e")=="1";
     if(server.hasArg(String(p)+"_f")) e.feed    = server.arg(String(p)+"_f").toInt();
-    for(int i = 0; i < 3; i++) {
-      String k = String(p) + String(i);
+    for(int i=0;i<3;i++){
+      String k = String(p)+String(i);
       if(server.hasArg(k+"_m")) e.msg[i]    = server.arg(k+"_m");
-      if(server.hasArg(k+"_s")) e.size[i]   = server.arg(k+"_s").toInt();
+      if(server.hasArg(k+"_s")) e.font[i]   = (uint8_t)server.arg(k+"_s").toInt();
       if(server.hasArg(k+"_a")) e.align[i]  = server.arg(k+"_a").toInt();
-      if(server.hasArg(k+"_b")) e.bold[i]   = server.arg(k+"_b") == "1";
-      if(server.hasArg(k+"_i")) e.invert[i] = server.arg(k+"_i") == "1";
+      if(server.hasArg(k+"_b")) e.bold[i]   = server.arg(k+"_b")=="1";
+      if(server.hasArg(k+"_i")) e.invert[i] = server.arg(k+"_i")=="1";
     }
   };
-  updEvt("sub",  twitchCfg.subs);
-  updEvt("bit",  twitchCfg.bits);
-  updEvt("pts",  twitchCfg.points);
-  updEvt("raid", twitchCfg.raids);
-  if(server.hasArg("pts_filter")) {
-    pointsRewardFilter = server.arg("pts_filter");
-    pointsRewardFilter.trim();
-  }
+  updEvt("sub",twitchCfg.subs); updEvt("bit",twitchCfg.bits);
+  updEvt("pts",twitchCfg.points); updEvt("raid",twitchCfg.raids);
+  if(server.hasArg("pts_filter")){ pointsRewardFilter=server.arg("pts_filter"); pointsRewardFilter.trim(); }
   shouldSaveConfig = true;
-  server.send(200, "text/plain", "Config Saved!");
+  server.send(200,"text/plain","Config Saved!");
 }
 
 void handleTestEvent() {
-  if(!printerConnected) { server.send(400, "text/plain", "No Printer"); return; }
+  if(!printerConnected) { server.send(400,"text/plain","No Printer"); return; }
   EventConfig tCfg;
-  String type  = server.arg("type");
+  String type = server.arg("type");
   tCfg.enabled = true;
   tCfg.feed    = server.arg("f").toInt();
-  for(int i = 0; i < 3; i++) {
+  for(int i=0;i<3;i++){
     tCfg.msg[i]    = server.arg("m"+String(i));
-    tCfg.size[i]   = server.arg("s"+String(i)).toInt();
+    tCfg.font[i]   = (uint8_t)server.arg("s"+String(i)).toInt();
     tCfg.align[i]  = server.arg("a"+String(i)).toInt();
-    tCfg.bold[i]   = server.arg("b"+String(i)) == "1";
-    tCfg.invert[i] = server.arg("i"+String(i)) == "1";
+    tCfg.bold[i]   = server.arg("b"+String(i))=="1";
+    tCfg.invert[i] = server.arg("i"+String(i))=="1";
   }
-  if     (type == "sub")  printEvent(tCfg, "TestUser", "",     "");
-  else if(type == "bit")  printEvent(tCfg, "TestUser", "1000", "");
-  else if(type == "pts")  printEvent(tCfg, "TestUser", "",     "Hydrate :>");
-  else if(type == "raid") printEvent(tCfg, "TestUser", "",     "");
-  server.send(200, "text/plain", "Test Sent");
+  if     (type=="sub")  printEvent(tCfg,"TestUser","","");
+  else if(type=="bit")  printEvent(tCfg,"TestUser","1000","");
+  else if(type=="pts")  printEvent(tCfg,"TestUser","","Hydrate :>");
+  else if(type=="raid") printEvent(tCfg,"TestUser","","");
+  server.send(200,"text/plain","Test Sent");
 }
 
 // ========== SETUP & LOOP ==========
@@ -832,21 +861,16 @@ void handleTestEvent() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\nESP32-C3 Thermal Printer (Bitmap Mode)");
+  Serial.println("\n\nESP32-C3 Thermal Printer (U8g2 Font Mode)");
   loadConfig();
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
   WiFi.begin(MYSSID, MYPSK);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nWiFi OK");
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
-  if(MDNS.begin(hostname)) {
-    Serial.println(String("mDNS: http://") + hostname + ".local");
-    MDNS.addService("http", "tcp", 80);
-  }
+  Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
+  if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); Serial.println("mDNS: http://c3printer.local"); }
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
-  Serial.println("OTA Ready");
   connectTwitch();
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
@@ -863,21 +887,12 @@ void setup() {
 
 void loop() {
   ArduinoOTA.handle();
-  if(shouldSaveConfig) {
-    saveConfig();
-    shouldSaveConfig = false;
-  }
+  if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
-  static unsigned long lastTwitchRetry  = 0;
-  static unsigned long lastPrinterRetry = 0;
+  static unsigned long lastTwitchRetry = 0, lastPrinterRetry = 0;
   unsigned long now = millis();
-  if(twitchConnected) {
-    handleTwitchIRC();
-  } else {
-    if(now - lastTwitchRetry > 10000) { lastTwitchRetry = now; connectTwitch(); }
-  }
-  if(!printerConnected) {
-    if(now - lastPrinterRetry > 15000) { lastPrinterRetry = now; connectPrinter(); }
-  }
+  if(twitchConnected)   handleTwitchIRC();
+  else if(now - lastTwitchRetry  > 10000) { lastTwitchRetry  = now; connectTwitch();   }
+  if(!printerConnected && now - lastPrinterRetry > 15000) { lastPrinterRetry = now; connectPrinter(); }
   delay(10);
 }
