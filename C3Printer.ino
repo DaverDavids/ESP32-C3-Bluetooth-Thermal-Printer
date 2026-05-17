@@ -36,29 +36,15 @@ const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
 // ========== U8G2 FONT TABLE ==========
-// Font IDs are stored in EventConfig.font[] and in Preferences (key _s).
-//
-// _tf  = transparent, full character set (ISO 8859 Latin extended — accents, etc.)
+// _tf  = transparent, full character set (ISO 8859 Latin extended)
 // _tr  = transparent, ASCII 32-127 only
-// Note: the X11 monospace fonts (5x7, 6x10, 7x13, etc.) do NOT have a _t_all
-//       variant. Use _tf for extended Latin. For full Unicode use Unifont.
-//
-// X11 serif/sans families (ncenR, helvR, helvB) only ship certain sizes in U8g2:
-//   ncenR:  08, 10, 14, 24  — sizes 12 and 18 are absent
-//   helvR:  08, 10, 14, 24  — sizes 12 and 18 are absent
-//   helvB:  08, 10, 12, 14, 18, 24
-// We map:  "Serif 12" -> ncenR14,  "Serif 18" -> ncenR24
-//          "Sans 12"  -> helvR14,  "Sans 18"  -> helvR24
-//          "Sans Bold 12/18" -> helvB12/helvB18 (these DO exist)
-//
-// Unifont: correct name is u8g2_font_unifont_tf (full 16px Unicode bitmap font).
-// The _t_unifont suffix does not exist in the library.
+// Unifont: u8g2_font_unifont_tf  (the _t_unifont suffix does not exist)
 
 struct FontEntry {
   uint8_t     id;
   const char* label;
   const uint8_t* font;
-  uint8_t     charH;   // nominal pixel height for line-spacing calculation
+  uint8_t     charH;
 };
 
 #define FONT_5X7         0
@@ -87,37 +73,37 @@ struct FontEntry {
 #define FONT_CYRILLIC_L  23
 
 const FontEntry FONT_TABLE[] = {
-  { FONT_5X7,        "5x7",              u8g2_font_5x7_tf,             7  },
-  { FONT_6X10,       "6x10",             u8g2_font_6x10_tf,            10 },
-  { FONT_7X13,       "7x13",             u8g2_font_7x13_tf,            13 },
-  { FONT_7X13B,      "7x13 Bold",        u8g2_font_7x13B_tf,           13 },
-  { FONT_8X13,       "8x13",             u8g2_font_8x13_tf,            13 },
-  { FONT_8X13B,      "8x13 Bold",        u8g2_font_8x13B_tf,           13 },
-  { FONT_9X15,       "9x15",             u8g2_font_9x15_tf,            15 },
-  { FONT_9X15B,      "9x15 Bold",        u8g2_font_9x15B_tf,           15 },
-  { FONT_10X20,      "10x20",            u8g2_font_10x20_tf,           20 },
-  { FONT_NCENR12,    "Serif 14",         u8g2_font_ncenR14_tf,         14 },  // ncenR12 missing; use 14
-  { FONT_NCENR14,    "Serif 14",         u8g2_font_ncenR14_tf,         14 },
-  { FONT_NCENR18,    "Serif 24",         u8g2_font_ncenR24_tf,         24 },  // ncenR18 missing; use 24
-  { FONT_HELVR12,    "Sans 14",          u8g2_font_helvR14_tf,         14 },  // helvR12 missing; use 14
-  { FONT_HELVR14,    "Sans 14",          u8g2_font_helvR14_tf,         14 },
-  { FONT_HELVR18,    "Sans 24",          u8g2_font_helvR24_tf,         24 },  // helvR18 missing; use 24
-  { FONT_HELVB12,    "Sans Bold 12",     u8g2_font_helvB12_tf,         12 },
-  { FONT_HELVB14,    "Sans Bold 14",     u8g2_font_helvB14_tf,         14 },
-  { FONT_HELVB18,    "Sans Bold 18",     u8g2_font_helvB18_tf,         18 },
-  { FONT_LOGISOSO28, "Logisoso 28",      u8g2_font_logisoso28_tf,      28 },
-  { FONT_LOGISOSO32, "Logisoso 32",      u8g2_font_logisoso32_tf,      32 },
-  { FONT_LOGISOSO42, "Logisoso 42",      u8g2_font_logisoso42_tf,      42 },
-  { FONT_UNIFONT,    "Unifont (Unicode)", u8g2_font_unifont_tf,         16 },  // was _t_unifont (invalid)
-  { FONT_CYRILLIC_S, "5x7 Cyrillic",    u8g2_font_5x7_t_cyrillic,     7  },
-  { FONT_CYRILLIC_L, "9x15 Cyrillic",   u8g2_font_9x15_t_cyrillic,    15 },
+  { FONT_5X7,        "5x7",               u8g2_font_5x7_tf,        7  },
+  { FONT_6X10,       "6x10",              u8g2_font_6x10_tf,       10 },
+  { FONT_7X13,       "7x13",              u8g2_font_7x13_tf,       13 },
+  { FONT_7X13B,      "7x13 Bold",         u8g2_font_7x13B_tf,      13 },
+  { FONT_8X13,       "8x13",              u8g2_font_8x13_tf,       13 },
+  { FONT_8X13B,      "8x13 Bold",         u8g2_font_8x13B_tf,      13 },
+  { FONT_9X15,       "9x15",              u8g2_font_9x15_tf,       15 },
+  { FONT_9X15B,      "9x15 Bold",         u8g2_font_9x15B_tf,      15 },
+  { FONT_10X20,      "10x20",             u8g2_font_10x20_tf,      20 },
+  { FONT_NCENR12,    "Serif 14",          u8g2_font_ncenR14_tf,    14 },
+  { FONT_NCENR14,    "Serif 14",          u8g2_font_ncenR14_tf,    14 },
+  { FONT_NCENR18,    "Serif 24",          u8g2_font_ncenR24_tf,    24 },
+  { FONT_HELVR12,    "Sans 14",           u8g2_font_helvR14_tf,    14 },
+  { FONT_HELVR14,    "Sans 14",           u8g2_font_helvR14_tf,    14 },
+  { FONT_HELVR18,    "Sans 24",           u8g2_font_helvR24_tf,    24 },
+  { FONT_HELVB12,    "Sans Bold 12",      u8g2_font_helvB12_tf,    12 },
+  { FONT_HELVB14,    "Sans Bold 14",      u8g2_font_helvB14_tf,    14 },
+  { FONT_HELVB18,    "Sans Bold 18",      u8g2_font_helvB18_tf,    18 },
+  { FONT_LOGISOSO28, "Logisoso 28",       u8g2_font_logisoso28_tf, 28 },
+  { FONT_LOGISOSO32, "Logisoso 32",       u8g2_font_logisoso32_tf, 32 },
+  { FONT_LOGISOSO42, "Logisoso 42",       u8g2_font_logisoso42_tf, 42 },
+  { FONT_UNIFONT,    "Unifont (Unicode)",  u8g2_font_unifont_tf,    16 },
+  { FONT_CYRILLIC_S, "5x7 Cyrillic",      u8g2_font_5x7_t_cyrillic,  7 },
+  { FONT_CYRILLIC_L, "9x15 Cyrillic",     u8g2_font_9x15_t_cyrillic, 15 },
 };
 const int FONT_TABLE_SIZE = sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]);
 
 const FontEntry* getFontEntry(uint8_t id) {
   for (int i = 0; i < FONT_TABLE_SIZE; i++)
     if (FONT_TABLE[i].id == id) return &FONT_TABLE[i];
-  return &FONT_TABLE[2]; // fallback: 7x13
+  return &FONT_TABLE[2];
 }
 
 // ========== STRUCTS ==========
@@ -125,8 +111,8 @@ const FontEntry* getFontEntry(uint8_t id) {
 struct EventConfig {
   bool    enabled = true;
   String  msg[3];
-  uint8_t font[3];   // font ID from FONT_TABLE
-  int     align[3];  // 0=L 1=C 2=R
+  uint8_t font[3];
+  int     align[3];
   bool    bold[3];
   bool    invert[3];
   int     feed = 3;
@@ -202,8 +188,6 @@ String processNewlines(String text) {
   return text;
 }
 
-// Pass valid UTF-8 sequences through intact so U8g2 fonts can render them.
-// Strips only genuine control characters (< 0x20, except \n) and malformed bytes.
 String sanitizeText(String text) {
   String result = "";
   int i = 0, len = (int)text.length();
@@ -212,11 +196,10 @@ String sanitizeText(String text) {
     if (c == '\n') {
       result += '\n'; i++;
     } else if (c < 0x20 || c == 0x7F) {
-      i++; // control char — skip silently
+      i++;
     } else if (c <= 0x7E) {
-      result += (char)c; i++; // plain printable ASCII
+      result += (char)c; i++;
     } else if (c >= 0xF0 && c <= 0xF7) {
-      // 4-byte UTF-8
       if (i+3 < len &&
           ((unsigned char)text[i+1]&0xC0)==0x80 &&
           ((unsigned char)text[i+2]&0xC0)==0x80 &&
@@ -224,29 +207,24 @@ String sanitizeText(String text) {
         result+=text[i]; result+=text[i+1]; result+=text[i+2]; result+=text[i+3]; i+=4;
       } else { i++; }
     } else if (c >= 0xE0 && c <= 0xEF) {
-      // 3-byte UTF-8
       if (i+2 < len &&
           ((unsigned char)text[i+1]&0xC0)==0x80 &&
           ((unsigned char)text[i+2]&0xC0)==0x80) {
         result+=text[i]; result+=text[i+1]; result+=text[i+2]; i+=3;
       } else { i++; }
     } else if (c >= 0xC0 && c <= 0xDF) {
-      // 2-byte UTF-8
       if (i+1 < len && ((unsigned char)text[i+1]&0xC0)==0x80) {
         result+=text[i]; result+=text[i+1]; i+=2;
       } else { i++; }
     } else {
-      i++; // lone continuation byte — skip
+      i++;
     }
   }
   return result;
 }
 
-// Word-wrap using actual rendered pixel width via U8g2 getUTF8Width().
-// A temporary U8g2 instance is used purely for measurement.
 String wordWrap(const String& text, int maxWidth, const uint8_t* font) {
   U8G2_FOR_ADAFRUIT_GFX u8measure;
-  // begin() needs a GFX object; use a tiny 1x1 throwaway canvas
   PrintCanvas dummy(8, 8);
   u8measure.begin(dummy);
   u8measure.setFont(font);
@@ -259,18 +237,15 @@ String wordWrap(const String& text, int maxWidth, const uint8_t* font) {
     if (lineEnd < 0) lineEnd = textLen;
     String line = text.substring(lineStart, lineEnd);
 
-    // If the whole line fits, emit it directly
     if (u8measure.getUTF8Width(line.c_str()) <= maxWidth) {
       result += line;
       if (lineEnd < textLen) result += "\n";
     } else {
-      // Break the line word by word
       while (line.length() > 0) {
         if (u8measure.getUTF8Width(line.c_str()) <= maxWidth) {
           result += line;
           break;
         }
-        // Binary-search for the longest prefix that fits
         int lo = 1, hi = line.length(), breakAt = 1;
         while (lo <= hi) {
           int mid = (lo + hi) / 2;
@@ -281,7 +256,6 @@ String wordWrap(const String& text, int maxWidth, const uint8_t* font) {
             hi = mid - 1;
           }
         }
-        // Prefer breaking at a word boundary
         int lastSpace = line.lastIndexOf(' ', breakAt);
         if (lastSpace > 0) breakAt = lastSpace;
         result += line.substring(0, breakAt);
@@ -364,7 +338,7 @@ bool printToThermal(String text, uint8_t fontId, int align, bool bold, bool inve
     U8G2_FOR_ADAFRUIT_GFX u8g2;
     u8g2.begin(canvas);
     u8g2.setFont(fe->font);
-    u8g2.setFontMode(1);           // transparent background
+    u8g2.setFontMode(1);
     u8g2.setFontDirection(0);
     u8g2.setForegroundColor(invert ? 0 : 1);
     u8g2.setBackgroundColor(invert ? 1 : 0);
@@ -384,7 +358,6 @@ bool printToThermal(String text, uint8_t fontId, int align, bool bold, bool inve
         u8g2.setCursor(x, drawY);
         u8g2.print(line);
         if(bold) {
-          // Simulated bold: redraw shifted 1px right
           u8g2.setCursor(x + 1, drawY);
           u8g2.print(line);
         }
@@ -639,7 +612,7 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 
 <div class="card">
   <h2>Manual Test Print</h2>
-  <textarea id="t_txt">Hello! Café résumé naïve Привет</textarea>
+  <textarea id="t_txt">Hello! Cafe resume naive Privet</textarea>
   <div class="line-row" style="margin-top:6px">
     <div class="ctl font-ctl">
       <select id="t_s"></select>
