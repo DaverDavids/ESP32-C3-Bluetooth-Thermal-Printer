@@ -47,6 +47,25 @@ struct FontEntry {
   uint8_t     charH;
 };
 
+// ========== STRUCTS ==========
+
+struct EventConfig {
+  bool    enabled = true;
+  String  msg[3];
+  uint8_t font[3];
+  int     align[3];
+  bool    bold[3];
+  bool    invert[3];
+  int     feed = 3;
+};
+
+struct TwitchConfig {
+  EventConfig subs;
+  EventConfig bits;
+  EventConfig points;
+  EventConfig raids;
+} twitchCfg;
+
 #define FONT_5X7         0
 #define FONT_6X10        1
 #define FONT_7X13        2
@@ -105,25 +124,6 @@ const FontEntry* getFontEntry(uint8_t id) {
     if (FONT_TABLE[i].id == id) return &FONT_TABLE[i];
   return &FONT_TABLE[2];
 }
-
-// ========== STRUCTS ==========
-
-struct EventConfig {
-  bool    enabled = true;
-  String  msg[3];
-  uint8_t font[3];
-  int     align[3];
-  bool    bold[3];
-  bool    invert[3];
-  int     feed = 3;
-};
-
-struct TwitchConfig {
-  EventConfig subs;
-  EventConfig bits;
-  EventConfig points;
-  EventConfig raids;
-} twitchCfg;
 
 void initDefaults() {
   twitchCfg.subs.msg[0] = "NEW SUB:";
