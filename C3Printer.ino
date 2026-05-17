@@ -56,6 +56,25 @@ struct SizeEntry {
   uint8_t     charH;
 };
 
+// ========== STRUCTS ==========
+
+struct EventConfig {
+  bool    enabled = true;
+  String  msg[3];
+  uint8_t font[3];   // stores FSIZE_* id
+  int     align[3];
+  bool    bold[3];
+  bool    invert[3];
+  int     feed = 3;
+};
+
+struct TwitchConfig {
+  EventConfig subs;
+  EventConfig bits;
+  EventConfig points;
+  EventConfig raids;
+} twitchCfg;
+
 const SizeEntry SIZE_TABLE[] = {
   { FSIZE_SMALL,  "Small",   u8g2_font_6x10_tf,       u8g2_font_7x13B_tf,      10 },
   { FSIZE_MEDIUM, "Medium",  u8g2_font_8x13_tf,        u8g2_font_8x13B_tf,      13 },
@@ -75,25 +94,6 @@ const SizeEntry* getSizeEntry(uint8_t id) {
     if (SIZE_TABLE[i].id == id) return &SIZE_TABLE[i];
   return &SIZE_TABLE[1]; // default Medium
 }
-
-// ========== STRUCTS ==========
-
-struct EventConfig {
-  bool    enabled = true;
-  String  msg[3];
-  uint8_t font[3];   // stores FSIZE_* id
-  int     align[3];
-  bool    bold[3];
-  bool    invert[3];
-  int     feed = 3;
-};
-
-struct TwitchConfig {
-  EventConfig subs;
-  EventConfig bits;
-  EventConfig points;
-  EventConfig raids;
-} twitchCfg;
 
 void initDefaults() {
   twitchCfg.subs.msg[0] = "NEW SUB:";
