@@ -575,7 +575,7 @@ void saveConfig() {
   saveEvent("sub",  twitchCfg.subs);
   saveEvent("bit",  twitchCfg.bits);
   saveEvent("pts",  twitchCfg.points);
-  saveEvent("raid\", twitchCfg.raids);
+  saveEvent("raid", twitchCfg.raids);
   preferences.putString("pts_filter", pointsRewardFilter);
   preferences.end();
   Serial.println("Config saved");
