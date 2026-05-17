@@ -48,12 +48,20 @@ const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 #define FSIZE_XLARGE  3   // ~20px — large text
 #define FSIZE_HUGE    4   // ~28px — headlines
 
+// Global print scale multiplier. Each rendered bitmap row/column is repeated this
+// many times before sending to the printer, giving crisp pixel-scaled output.
+// 2 = 2x size (recommended for small thermal printers where even Large feels tiny).
+// Adjust to taste: 1 = native, 3 = very large.
+#define PRINT_SCALE 2
+
 struct SizeEntry {
   uint8_t     id;
   const char* label;
   const uint8_t* fontNormal;
   const uint8_t* fontBold;
   uint8_t     charH;
+  const uint8_t* unicodeFallback;  // per-size Unicode font (Katakana, CJK, etc.)
+  uint8_t     fallbackH;           // raw height of the Unicode fallback font
 };
 
 // ========== STRUCTS ==========
@@ -75,17 +83,25 @@ struct TwitchConfig {
   EventConfig raids;
 } twitchCfg;
 
+// charH = native height of the primary font (pre-PRINT_SCALE).
+// unicodeFallback is the closest-height Unicode font available in U8g2 for each tier.
+// All fonts render at charH * PRINT_SCALE on the actual paper.
 const SizeEntry SIZE_TABLE[] = {
-  { FSIZE_SMALL,  "Small",   u8g2_font_6x10_tf,       u8g2_font_7x13B_tf,      10 },
-  { FSIZE_MEDIUM, "Medium",  u8g2_font_8x13_tf,        u8g2_font_8x13B_tf,      13 },
-  { FSIZE_LARGE,  "Large",   u8g2_font_9x15_tf,        u8g2_font_9x15B_tf,      15 },
-  { FSIZE_XLARGE, "X-Large", u8g2_font_10x20_tf,       u8g2_font_10x20_tf,      20 },
-  { FSIZE_HUGE,   "Huge",    u8g2_font_logisoso28_tf,  u8g2_font_logisoso28_tf, 28 },
+  { FSIZE_SMALL,  "Small",   u8g2_font_6x10_tf,       u8g2_font_7x13B_tf,
+    10, u8g2_font_unifont_t_japanese1, 16 },
+  { FSIZE_MEDIUM, "Medium",  u8g2_font_8x13_tf,        u8g2_font_8x13B_tf,
+    13, u8g2_font_unifont_t_japanese1, 16 },
+  { FSIZE_LARGE,  "Large",   u8g2_font_9x15_tf,        u8g2_font_9x15B_tf,
+    15, u8g2_font_unifont_t_japanese1, 16 },
+  { FSIZE_XLARGE, "X-Large", u8g2_font_10x20_tf,       u8g2_font_10x20_tf,
+    20, u8g2_font_unifont_t_japanese2, 16 },
+  { FSIZE_HUGE,   "Huge",    u8g2_font_logisoso28_tf,  u8g2_font_logisoso28_tf,
+    28, u8g2_font_unifont_t_japanese2, 16 },
 };
 const int SIZE_TABLE_LEN = sizeof(SIZE_TABLE) / sizeof(SIZE_TABLE[0]);
 
-// Fallback font for non-Latin Unicode (Katakana, CJK, Greek, Arabic, etc.)
-// unifont_t_japanese1 covers JIS Level 1+2 (6879 chars) + full Latin
+// Global fallback kept for contexts without a SizeEntry (e.g. wordWrap default).
+// Per-size fallback fonts are now in SizeEntry.unicodeFallback.
 const uint8_t* UNICODE_FALLBACK_FONT = u8g2_font_unifont_t_japanese1;
 const uint8_t  UNICODE_FALLBACK_H    = 16;
 
@@ -211,7 +227,7 @@ bool isLatinCodepoint(uint32_t cp) {
 }
 
 // Word-wrap using the wider of the two fonts for accurate measurement on mixed text
-String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont) {
+String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont, const SizeEntry* se = nullptr) {
   U8G2_FOR_ADAFRUIT_GFX u8m;
   PrintCanvas dummy(8, 8);
   u8m.begin(dummy);
@@ -234,7 +250,7 @@ String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont) {
         segEnd = i;
       }
       seg = line.substring(segStart, segEnd > segStart ? segEnd : i);
-      u8m.setFont(useFallback ? UNICODE_FALLBACK_FONT : primaryFont);
+      u8m.setFont(useFallback ? (se ? se->unicodeFallback : UNICODE_FALLBACK_FONT) : primaryFont);
       total += u8m.getUTF8Width(seg.c_str());
     }
     return total;
@@ -308,13 +324,16 @@ void feedPaper(int lines) {
 }
 
 // Draw one text line with automatic font fallback per Unicode segment.
-// Segments of Latin chars use primaryFont; non-Latin falls back to UNICODE_FALLBACK_FONT.
-// Returns the width drawn.
+// Segments of Latin chars use primaryFont; non-Latin uses se->unicodeFallback.
+// PRINT_SCALE is applied via repeated-row rendering in printToThermal.
+// Returns the width drawn (in canvas pixels, i.e. pre-scale).
 int drawLineMixed(U8G2_FOR_ADAFRUIT_GFX& u8g2, const String& line,
                   int x, int y, int fgColor,
-                  const uint8_t* primaryFont, bool bold) {
+                  const uint8_t* primaryFont, bool bold,
+                  const SizeEntry* se = nullptr) {
   int curX = x;
   int i = 0, len = line.length();
+  const uint8_t* fallbackFont = se ? se->unicodeFallback : UNICODE_FALLBACK_FONT;
   while (i < len) {
     int segStart = i;
     uint32_t cp = nextCodepoint(line, i);
@@ -327,12 +346,12 @@ int drawLineMixed(U8G2_FOR_ADAFRUIT_GFX& u8g2, const String& line,
       segEnd = i;
     }
     String seg = line.substring(segStart, segEnd > segStart ? segEnd : i);
-    const uint8_t* useFont = useFallback ? UNICODE_FALLBACK_FONT : primaryFont;
+    const uint8_t* useFont = useFallback ? (se ? se->unicodeFallback : UNICODE_FALLBACK_FONT) : primaryFont;
     u8g2.setFont(useFont);
     u8g2.setForegroundColor(fgColor);
     u8g2.setCursor(curX, y);
     u8g2.print(seg);
-    if (bold && !useFallback) { // bold = double-print shifted 1px (Latin only, fallback font already readable)
+    if (bold && !useFallback) { // bold = double-print shifted 1px (Latin only)
       u8g2.setCursor(curX + 1, y);
       u8g2.print(seg);
     }
@@ -349,14 +368,17 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
   const SizeEntry* se = getSizeEntry(sizeId);
   const uint8_t* primaryFont = bold ? se->fontBold : se->fontNormal;
 
-  int maxTextWidth = PRINTER_WIDTH - 6;
-  text = wordWrap(text, maxTextWidth, primaryFont);
+  // Render at 1/PRINT_SCALE width, then scale up by repeating pixels/rows.
+  // This gives clean crisp scaling for bitmap fonts (avoids blurry stretching).
+  int renderW       = PRINTER_WIDTH / PRINT_SCALE;
+  int maxTextWidth  = renderW - 6;
+  text = wordWrap(text, maxTextWidth, primaryFont, se);
 
   int totalLines = 1;
   for(int i = 0; i < (int)text.length(); i++) if(text[i] == '\n') totalLines++;
 
-  // Use the taller of the two possible fonts for line height
-  int charHeight  = max((int)se->charH, (int)UNICODE_FALLBACK_H);
+  // Line height uses the taller of primary vs unicode fallback (pre-scale)
+  int charHeight  = max((int)se->charH, (int)se->fallbackH);
   int lineSpacing = max(2, charHeight / 6);
   int lineHeight  = charHeight + lineSpacing;
   int linesPerChunk = max(1, 200 / lineHeight);
@@ -372,10 +394,10 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
     }
     if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += lineSpacing * 2;
 
-    PrintCanvas canvas(PRINTER_WIDTH, chunkHeight);
+    PrintCanvas canvas(renderW, chunkHeight);
     if(!canvas.buffer) { Serial.println("Chunk alloc failed!"); return false; }
 
-    if(invert) canvas.fillRect(0, 0, PRINTER_WIDTH, chunkHeight, 1);
+    if(invert) canvas.fillRect(0, 0, renderW, chunkHeight, 1);
 
     U8G2_FOR_ADAFRUIT_GFX u8g2;
     u8g2.begin(canvas);
@@ -407,21 +429,47 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
             me = mi;
           }
           String seg = line.substring(ms, me > ms ? me : mi);
-          u8m.setFont(fb ? UNICODE_FALLBACK_FONT : primaryFont);
+          u8m.setFont(fb ? se->unicodeFallback : primaryFont);
           tw += u8m.getUTF8Width(seg.c_str());
         }
 
         int x = 2;
-        if     (align == 1) x = max(0, (PRINTER_WIDTH - tw) / 2);
-        else if(align == 2) x = max(2, PRINTER_WIDTH - tw - 2);
+        if     (align == 1) x = max(0, (renderW - tw) / 2);
+        else if(align == 2) x = max(2, renderW - tw - 2);
 
-        drawLineMixed(u8g2, line, x, drawY, fgColor, primaryFont, bold);
+        drawLineMixed(u8g2, line, x, drawY, fgColor, primaryFont, bold, se);
       }
       drawY    += lineHeight;
       textIndex = lineEnd + 1;
     }
 
-    printBitmap(canvas.buffer, PRINTER_WIDTH, chunkHeight);
+    // Scale up: repeat each row and column PRINT_SCALE times for crisp 2x output
+    {
+      int scaledH = chunkHeight * PRINT_SCALE;
+      int scaledWBytes = PRINTER_WIDTH / 8;
+      int renderWBytes = renderW / 8;
+      uint8_t* scaled = (uint8_t*)malloc(scaledWBytes * scaledH);
+      if (scaled) {
+        memset(scaled, 0, scaledWBytes * scaledH);
+        for (int row = 0; row < chunkHeight; row++) {
+          const uint8_t* srcRow = canvas.buffer + row * renderWBytes;
+          for (int rep = 0; rep < PRINT_SCALE; rep++) {
+            uint8_t* dstRow = scaled + (row * PRINT_SCALE + rep) * scaledWBytes;
+            for (int dstBit = 0; dstBit < PRINTER_WIDTH; dstBit++) {
+              int srcBit = dstBit / PRINT_SCALE;
+              if (srcBit < renderW) {
+                int sb = srcBit / 8, sbit = 7 - (srcBit % 8);
+                if (srcRow[sb] & (1 << sbit)) {
+                  dstRow[dstBit / 8] |= (1 << (7 - (dstBit % 8)));
+                }
+              }
+            }
+          }
+        }
+        printBitmap(scaled, PRINTER_WIDTH, scaledH);
+        free(scaled);
+      }
+    }
     currentLineIndex += chunkLineCount;
     delay(20);
   }
