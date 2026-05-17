@@ -35,24 +35,53 @@ bool shouldSaveConfig = false;
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
-// ========== U8G2 FONT TABLE ==========
-// _tf  = transparent, full character set (ISO 8859 Latin extended)
-// _tr  = transparent, ASCII 32-127 only
-// Unifont: u8g2_font_unifont_tf  (the _t_unifont suffix does not exist)
+// ========== FONT SYSTEM ==========
+// User picks a SIZE (0-4) and bold (true/false) separately.
+// Each size has a normal and bold variant for Latin/extended.
+// For any character outside Latin range, we automatically fall back
+// to the Japanese Unifont which covers Katakana, CJK, Greek, Arabic, etc.
 
-struct FontEntry {
+// Size IDs
+#define FSIZE_SMALL   0   // ~7px  — tiny labels
+#define FSIZE_MEDIUM  1   // ~13px — standard
+#define FSIZE_LARGE   2   // ~15px — bigger
+#define FSIZE_XLARGE  3   // ~20px — large text
+#define FSIZE_HUGE    4   // ~28px — headlines
+
+struct SizeEntry {
   uint8_t     id;
   const char* label;
-  const uint8_t* font;
+  const uint8_t* fontNormal;
+  const uint8_t* fontBold;
   uint8_t     charH;
 };
+
+const SizeEntry SIZE_TABLE[] = {
+  { FSIZE_SMALL,  "Small",   u8g2_font_6x10_tf,       u8g2_font_7x13B_tf,      10 },
+  { FSIZE_MEDIUM, "Medium",  u8g2_font_8x13_tf,        u8g2_font_8x13B_tf,      13 },
+  { FSIZE_LARGE,  "Large",   u8g2_font_9x15_tf,        u8g2_font_9x15B_tf,      15 },
+  { FSIZE_XLARGE, "X-Large", u8g2_font_10x20_tf,       u8g2_font_10x20_tf,      20 },
+  { FSIZE_HUGE,   "Huge",    u8g2_font_logisoso28_tf,  u8g2_font_logisoso28_tf, 28 },
+};
+const int SIZE_TABLE_LEN = sizeof(SIZE_TABLE) / sizeof(SIZE_TABLE[0]);
+
+// Fallback font for non-Latin Unicode (Katakana, CJK, Greek, Arabic, etc.)
+// unifont_t_japanese1 covers JIS Level 1+2 (6879 chars) + full Latin
+const uint8_t* UNICODE_FALLBACK_FONT = u8g2_font_unifont_t_japanese1;
+const uint8_t  UNICODE_FALLBACK_H    = 16;
+
+const SizeEntry* getSizeEntry(uint8_t id) {
+  for (int i = 0; i < SIZE_TABLE_LEN; i++)
+    if (SIZE_TABLE[i].id == id) return &SIZE_TABLE[i];
+  return &SIZE_TABLE[1]; // default Medium
+}
 
 // ========== STRUCTS ==========
 
 struct EventConfig {
   bool    enabled = true;
   String  msg[3];
-  uint8_t font[3];
+  uint8_t font[3];   // stores FSIZE_* id
   int     align[3];
   bool    bold[3];
   bool    invert[3];
@@ -66,92 +95,33 @@ struct TwitchConfig {
   EventConfig raids;
 } twitchCfg;
 
-#define FONT_5X7         0
-#define FONT_6X10        1
-#define FONT_7X13        2
-#define FONT_7X13B       3
-#define FONT_8X13        4
-#define FONT_8X13B       5
-#define FONT_9X15        6
-#define FONT_9X15B       7
-#define FONT_10X20       8
-#define FONT_NCENR12     9
-#define FONT_NCENR14     10
-#define FONT_NCENR18     11
-#define FONT_HELVR12     12
-#define FONT_HELVR14     13
-#define FONT_HELVR18     14
-#define FONT_HELVB12     15
-#define FONT_HELVB14     16
-#define FONT_HELVB18     17
-#define FONT_LOGISOSO28  18
-#define FONT_LOGISOSO32  19
-#define FONT_LOGISOSO42  20
-#define FONT_UNIFONT     21
-#define FONT_CYRILLIC_S  22
-#define FONT_CYRILLIC_L  23
-
-const FontEntry FONT_TABLE[] = {
-  { FONT_5X7,        "5x7",               u8g2_font_5x7_tf,        7  },
-  { FONT_6X10,       "6x10",              u8g2_font_6x10_tf,       10 },
-  { FONT_7X13,       "7x13",              u8g2_font_7x13_tf,       13 },
-  { FONT_7X13B,      "7x13 Bold",         u8g2_font_7x13B_tf,      13 },
-  { FONT_8X13,       "8x13",              u8g2_font_8x13_tf,       13 },
-  { FONT_8X13B,      "8x13 Bold",         u8g2_font_8x13B_tf,      13 },
-  { FONT_9X15,       "9x15",              u8g2_font_9x15_tf,       15 },
-  { FONT_9X15B,      "9x15 Bold",         u8g2_font_9x15B_tf,      15 },
-  { FONT_10X20,      "10x20",             u8g2_font_10x20_tf,      20 },
-  { FONT_NCENR12,    "Serif 14",          u8g2_font_ncenR14_tf,    14 },
-  { FONT_NCENR14,    "Serif 14",          u8g2_font_ncenR14_tf,    14 },
-  { FONT_NCENR18,    "Serif 24",          u8g2_font_ncenR24_tf,    24 },
-  { FONT_HELVR12,    "Sans 14",           u8g2_font_helvR14_tf,    14 },
-  { FONT_HELVR14,    "Sans 14",           u8g2_font_helvR14_tf,    14 },
-  { FONT_HELVR18,    "Sans 24",           u8g2_font_helvR24_tf,    24 },
-  { FONT_HELVB12,    "Sans Bold 12",      u8g2_font_helvB12_tf,    12 },
-  { FONT_HELVB14,    "Sans Bold 14",      u8g2_font_helvB14_tf,    14 },
-  { FONT_HELVB18,    "Sans Bold 18",      u8g2_font_helvB18_tf,    18 },
-  { FONT_LOGISOSO28, "Logisoso 28",       u8g2_font_logisoso28_tf, 28 },
-  { FONT_LOGISOSO32, "Logisoso 32",       u8g2_font_logisoso32_tf, 32 },
-  { FONT_LOGISOSO42, "Logisoso 42",       u8g2_font_logisoso42_tf, 42 },
-  { FONT_UNIFONT,    "Unifont (Unicode)",  u8g2_font_unifont_tf,    16 },
-  { FONT_CYRILLIC_S, "5x7 Cyrillic",      u8g2_font_5x7_t_cyrillic,  7 },
-  { FONT_CYRILLIC_L, "9x15 Cyrillic",     u8g2_font_9x15_t_cyrillic, 15 },
-};
-const int FONT_TABLE_SIZE = sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]);
-
-const FontEntry* getFontEntry(uint8_t id) {
-  for (int i = 0; i < FONT_TABLE_SIZE; i++)
-    if (FONT_TABLE[i].id == id) return &FONT_TABLE[i];
-  return &FONT_TABLE[2];
-}
-
 void initDefaults() {
   twitchCfg.subs.msg[0] = "NEW SUB:";
   twitchCfg.subs.msg[1] = "{user}!";
   twitchCfg.subs.msg[2] = "";
   for(int i=0;i<3;i++){
-    twitchCfg.subs.font[i]=FONT_7X13; twitchCfg.subs.align[i]=1;
+    twitchCfg.subs.font[i]=FSIZE_MEDIUM; twitchCfg.subs.align[i]=1;
     twitchCfg.subs.bold[i]=true; twitchCfg.subs.invert[i]=false;
   }
   twitchCfg.bits.msg[0] = "CHEER:";
   twitchCfg.bits.msg[1] = "{user}";
   twitchCfg.bits.msg[2] = "{amount} bits";
   for(int i=0;i<3;i++){
-    twitchCfg.bits.font[i]=FONT_7X13; twitchCfg.bits.align[i]=1;
+    twitchCfg.bits.font[i]=FSIZE_MEDIUM; twitchCfg.bits.align[i]=1;
     twitchCfg.bits.bold[i]=true; twitchCfg.bits.invert[i]=false;
   }
   twitchCfg.points.msg[0] = "REDEEM:";
   twitchCfg.points.msg[1] = "{user}";
   twitchCfg.points.msg[2] = "{reward}";
   for(int i=0;i<3;i++){
-    twitchCfg.points.font[i]=FONT_7X13; twitchCfg.points.align[i]=1;
+    twitchCfg.points.font[i]=FSIZE_MEDIUM; twitchCfg.points.align[i]=1;
     twitchCfg.points.bold[i]=true; twitchCfg.points.invert[i]=false;
   }
   twitchCfg.raids.msg[0] = "RAID!";
   twitchCfg.raids.msg[1] = "from";
   twitchCfg.raids.msg[2] = "{user}";
   for(int i=0;i<3;i++){
-    twitchCfg.raids.font[i]=FONT_LOGISOSO28; twitchCfg.raids.align[i]=1;
+    twitchCfg.raids.font[i]=FSIZE_HUGE; twitchCfg.raids.align[i]=1;
     twitchCfg.raids.bold[i]=false; twitchCfg.raids.invert[i]=false;
   }
 }
@@ -188,6 +158,7 @@ String processNewlines(String text) {
   return text;
 }
 
+// Pass through valid UTF-8 sequences; strip bare control chars
 String sanitizeText(String text) {
   String result = "";
   int i = 0, len = (int)text.length();
@@ -217,17 +188,57 @@ String sanitizeText(String text) {
         result+=text[i]; result+=text[i+1]; i+=2;
       } else { i++; }
     } else {
-      i++;
+      i++; // lone continuation byte, skip
     }
   }
   return result;
 }
 
-String wordWrap(const String& text, int maxWidth, const uint8_t* font) {
-  U8G2_FOR_ADAFRUIT_GFX u8measure;
+// Decode one UTF-8 codepoint, advance index
+uint32_t nextCodepoint(const String& s, int& i) {
+  unsigned char c = (unsigned char)s[i];
+  if (c < 0x80)  { i++; return c; }
+  if (c < 0xC0)  { i++; return 0xFFFD; } // lone continuation
+  if (c < 0xE0)  { uint32_t cp = (c & 0x1F); i++; if(i<(int)s.length()) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
+  if (c < 0xF0)  { uint32_t cp = (c & 0x0F); i++; for(int j=0;j<2&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
+  { uint32_t cp = (c & 0x07); i++; for(int j=0;j<3&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
+}
+
+// Returns true if this codepoint is covered by the standard Latin/extended fonts
+// (i.e., ISO-8859 / basic Latin + extended Latin)
+bool isLatinCodepoint(uint32_t cp) {
+  return cp <= 0x024F; // Basic Latin + Latin-1 Supplement + Latin Extended-A/B
+}
+
+// Word-wrap using the wider of the two fonts for accurate measurement on mixed text
+String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont) {
+  U8G2_FOR_ADAFRUIT_GFX u8m;
   PrintCanvas dummy(8, 8);
-  u8measure.begin(dummy);
-  u8measure.setFont(font);
+  u8m.begin(dummy);
+
+  // Measure a line width accounting for font switching per segment
+  auto measureLine = [&](const String& line) -> int {
+    int total = 0, i = 0, len = line.length();
+    while (i < len) {
+      int segStart = i;
+      int startPos = i;
+      uint32_t cp = nextCodepoint(line, i);
+      bool useFallback = !isLatinCodepoint(cp);
+      // Collect run of same font type
+      String seg = line.substring(segStart, i);
+      int segEnd = i;
+      while (i < len) {
+        int before = i;
+        uint32_t cp2 = nextCodepoint(line, i);
+        if (!isLatinCodepoint(cp2) != useFallback) { i = before; break; }
+        segEnd = i;
+      }
+      seg = line.substring(segStart, segEnd > segStart ? segEnd : i);
+      u8m.setFont(useFallback ? UNICODE_FALLBACK_FONT : primaryFont);
+      total += u8m.getUTF8Width(seg.c_str());
+    }
+    return total;
+  };
 
   String result = "";
   int lineStart = 0, textLen = (int)text.length();
@@ -237,24 +248,18 @@ String wordWrap(const String& text, int maxWidth, const uint8_t* font) {
     if (lineEnd < 0) lineEnd = textLen;
     String line = text.substring(lineStart, lineEnd);
 
-    if (u8measure.getUTF8Width(line.c_str()) <= maxWidth) {
+    if (measureLine(line) <= maxWidth) {
       result += line;
       if (lineEnd < textLen) result += "\n";
     } else {
       while (line.length() > 0) {
-        if (u8measure.getUTF8Width(line.c_str()) <= maxWidth) {
-          result += line;
-          break;
-        }
+        if (measureLine(line) <= maxWidth) { result += line; break; }
         int lo = 1, hi = line.length(), breakAt = 1;
         while (lo <= hi) {
           int mid = (lo + hi) / 2;
           String test = line.substring(0, mid);
-          if (u8measure.getUTF8Width(test.c_str()) <= maxWidth) {
-            breakAt = mid; lo = mid + 1;
-          } else {
-            hi = mid - 1;
-          }
+          if (measureLine(test) <= maxWidth) { breakAt = mid; lo = mid + 1; }
+          else hi = mid - 1;
         }
         int lastSpace = line.lastIndexOf(' ', breakAt);
         if (lastSpace > 0) breakAt = lastSpace;
@@ -302,25 +307,62 @@ void feedPaper(int lines) {
   }
 }
 
-bool printToThermal(String text, uint8_t fontId, int align, bool bold, bool invert, int feedLines) {
+// Draw one text line with automatic font fallback per Unicode segment.
+// Segments of Latin chars use primaryFont; non-Latin falls back to UNICODE_FALLBACK_FONT.
+// Returns the width drawn.
+int drawLineMixed(U8G2_FOR_ADAFRUIT_GFX& u8g2, const String& line,
+                  int x, int y, int fgColor,
+                  const uint8_t* primaryFont, bool bold) {
+  int curX = x;
+  int i = 0, len = line.length();
+  while (i < len) {
+    int segStart = i;
+    uint32_t cp = nextCodepoint(line, i);
+    bool useFallback = !isLatinCodepoint(cp);
+    int segEnd = i;
+    while (i < len) {
+      int before = i;
+      uint32_t cp2 = nextCodepoint(line, i);
+      if (!isLatinCodepoint(cp2) != useFallback) { i = before; break; }
+      segEnd = i;
+    }
+    String seg = line.substring(segStart, segEnd > segStart ? segEnd : i);
+    const uint8_t* useFont = useFallback ? UNICODE_FALLBACK_FONT : primaryFont;
+    u8g2.setFont(useFont);
+    u8g2.setForegroundColor(fgColor);
+    u8g2.setCursor(curX, y);
+    u8g2.print(seg);
+    if (bold && !useFallback) { // bold = double-print shifted 1px (Latin only, fallback font already readable)
+      u8g2.setCursor(curX + 1, y);
+      u8g2.print(seg);
+    }
+    curX += u8g2.getUTF8Width(seg.c_str());
+  }
+  return curX - x;
+}
+
+bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool invert, int feedLines) {
   if(!printerConnected) return false;
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
 
   text = processNewlines(text);
-  const FontEntry* fe = getFontEntry(fontId);
+  const SizeEntry* se = getSizeEntry(sizeId);
+  const uint8_t* primaryFont = bold ? se->fontBold : se->fontNormal;
 
   int maxTextWidth = PRINTER_WIDTH - 6;
-  text = wordWrap(text, maxTextWidth, fe->font);
+  text = wordWrap(text, maxTextWidth, primaryFont);
 
   int totalLines = 1;
   for(int i = 0; i < (int)text.length(); i++) if(text[i] == '\n') totalLines++;
 
-  int charHeight    = fe->charH;
-  int lineSpacing   = max(2, charHeight / 6);
-  int lineHeight    = charHeight + lineSpacing;
+  // Use the taller of the two possible fonts for line height
+  int charHeight  = max((int)se->charH, (int)UNICODE_FALLBACK_H);
+  int lineSpacing = max(2, charHeight / 6);
+  int lineHeight  = charHeight + lineSpacing;
   int linesPerChunk = max(1, 200 / lineHeight);
 
   int currentLineIndex = 0, textIndex = 0;
+  int fgColor = invert ? 0 : 1;
 
   while(currentLineIndex < totalLines) {
     int chunkLineCount = 0, chunkHeight = 0;
@@ -337,10 +379,8 @@ bool printToThermal(String text, uint8_t fontId, int align, bool bold, bool inve
 
     U8G2_FOR_ADAFRUIT_GFX u8g2;
     u8g2.begin(canvas);
-    u8g2.setFont(fe->font);
     u8g2.setFontMode(1);
     u8g2.setFontDirection(0);
-    u8g2.setForegroundColor(invert ? 0 : 1);
     u8g2.setBackgroundColor(invert ? 1 : 0);
 
     int drawY = (currentLineIndex == 0) ? lineSpacing + charHeight : charHeight;
@@ -351,16 +391,31 @@ bool printToThermal(String text, uint8_t fontId, int align, bool bold, bool inve
       String line = text.substring(textIndex, lineEnd);
 
       if(line.length() > 0) {
-        int16_t tw = u8g2.getUTF8Width(line.c_str());
+        // Measure full line width for alignment (accounting for mixed fonts)
+        U8G2_FOR_ADAFRUIT_GFX u8m;
+        PrintCanvas dm(8, 8);
+        u8m.begin(dm);
+        int tw = 0, mi = 0, mlen = line.length();
+        while (mi < mlen) {
+          int ms = mi;
+          uint32_t cp = nextCodepoint(line, mi);
+          bool fb = !isLatinCodepoint(cp);
+          int me = mi;
+          while (mi < mlen) {
+            int mb = mi; uint32_t cp2 = nextCodepoint(line, mi);
+            if (!isLatinCodepoint(cp2) != fb) { mi = mb; break; }
+            me = mi;
+          }
+          String seg = line.substring(ms, me > ms ? me : mi);
+          u8m.setFont(fb ? UNICODE_FALLBACK_FONT : primaryFont);
+          tw += u8m.getUTF8Width(seg.c_str());
+        }
+
         int x = 2;
         if     (align == 1) x = max(0, (PRINTER_WIDTH - tw) / 2);
         else if(align == 2) x = max(2, PRINTER_WIDTH - tw - 2);
-        u8g2.setCursor(x, drawY);
-        u8g2.print(line);
-        if(bold) {
-          u8g2.setCursor(x + 1, drawY);
-          u8g2.print(line);
-        }
+
+        drawLineMixed(u8g2, line, x, drawY, fgColor, primaryFont, bold);
       }
       drawY    += lineHeight;
       textIndex = lineEnd + 1;
@@ -575,8 +630,8 @@ input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#a78bfa}
 .line-row{display:flex;gap:4px;align-items:center;margin-bottom:5px;background:#0f0f23;padding:5px;border-radius:5px;border:1px solid #2d2d5a}
 .line-row input[type=text]{flex:1;min-width:0}
 .ctl{display:flex;flex-direction:column;align-items:center;gap:2px;flex-shrink:0}
-.ctl.font-ctl{width:130px}
-.ctl.align-ctl{width:56px}
+.ctl.size-ctl{width:80px}
+.ctl.align-ctl{width:60px}
 .ctl.check-ctl{width:32px}
 .tiny-lbl{font-size:9px;color:#7c86c9;white-space:nowrap;text-align:center}
 .line-num{font-size:10px;color:#555;width:12px;text-align:center;flex-shrink:0}
@@ -612,11 +667,11 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 
 <div class="card">
   <h2>Manual Test Print</h2>
-  <textarea id="t_txt">Hello! Cafe resume naive Privet</textarea>
+  <textarea id="t_txt">Hello! Caf&#233; resum&#233; na&#239;ve &#1055;&#1088;&#1080;&#1074;&#1077;&#1090; &#12484;</textarea>
   <div class="line-row" style="margin-top:6px">
-    <div class="ctl font-ctl">
+    <div class="ctl size-ctl">
       <select id="t_s"></select>
-      <span class="tiny-lbl">Font</span>
+      <span class="tiny-lbl">Size</span>
     </div>
     <div class="ctl align-ctl">
       <select id="t_al"><option value="0">Left</option><option value="1" selected>Center</option><option value="2">Right</option></select>
@@ -632,21 +687,16 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 </div>
 
 <script>
-const FONTS = [
-  [0,"5x7"],[1,"6x10"],[2,"7x13"],[3,"7x13 Bold"],
-  [4,"8x13"],[5,"8x13 Bold"],[6,"9x15"],[7,"9x15 Bold"],[8,"10x20"],
-  [9,"Serif 14"],[10,"Serif 14"],[11,"Serif 24"],
-  [12,"Sans 14"],[13,"Sans 14"],[14,"Sans 24"],
-  [15,"Sans Bold 12"],[16,"Sans Bold 14"],[17,"Sans Bold 18"],
-  [18,"Logisoso 28"],[19,"Logisoso 32"],[20,"Logisoso 42"],
-  [21,"Unifont (Unicode)"],[22,"5x7 Cyrillic"],[23,"9x15 Cyrillic"]
+// Size IDs must match FSIZE_* defines in firmware
+const SIZES = [
+  [0,"Small"],[1,"Medium"],[2,"Large"],[3,"X-Large"],[4,"Huge"]
 ];
 
 const evts   = ['sub','bit','pts','raid'];
 const titles = ['Subscriptions','Bits','Points','Raids'];
 
-function fontOpts(sel) {
-  return FONTS.map(([id,lbl])=>`<option value="${id}"${id==sel?' selected':''}>${lbl}</option>`).join('');
+function sizeOpts(sel) {
+  return SIZES.map(([id,lbl])=>`<option value="${id}"${id==sel?' selected':''}>${lbl}</option>`).join('');
 }
 function alignOpts(sel) {
   return ['Left','Center','Right'].map((t,i)=>
@@ -664,9 +714,9 @@ function render() {
       h += `<div class="line-row">
         <span class="line-num">${l+1}</span>
         <input type="text" id="${k}${l}_m" placeholder="Line ${l+1} ({user} {amount} {reward})">
-        <div class="ctl font-ctl">
-          <select id="${k}${l}_s">${fontOpts(2)}</select>
-          <span class="tiny-lbl">Font</span>
+        <div class="ctl size-ctl">
+          <select id="${k}${l}_s">${sizeOpts(1)}</select>
+          <span class="tiny-lbl">Size</span>
         </div>
         <div class="ctl align-ctl">
           <select id="${k}${l}_a">${alignOpts(1)}</select>
@@ -687,7 +737,7 @@ function render() {
     h += `</div>`;
   });
   document.getElementById('cfg').innerHTML = h;
-  document.getElementById('t_s').innerHTML = fontOpts(2);
+  document.getElementById('t_s').innerHTML = sizeOpts(1);
 }
 
 function load() {
@@ -804,11 +854,11 @@ void handleDisconnect() { disconnectPrinter(); server.send(200,"text/plain","Dis
 void handlePrint() {
   if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
   String text = sanitizeText(server.arg("txt"));
-  uint8_t fontId = server.hasArg("sz") ? (uint8_t)server.arg("sz").toInt() : FONT_7X13;
+  uint8_t sizeId = server.hasArg("sz") ? (uint8_t)server.arg("sz").toInt() : FSIZE_MEDIUM;
   int  al  = server.hasArg("al")  ? server.arg("al").toInt()   : 1;
   bool b   = server.hasArg("b")   ? (server.arg("b")  =="1")   : true;
   bool inv = server.hasArg("inv") ? (server.arg("inv")=="1")   : false;
-  printToThermal(text, fontId, al, b, inv, 3);
+  printToThermal(text, sizeId, al, b, inv, 3);
   server.send(200,"text/plain","Printed!");
 }
 
@@ -855,7 +905,7 @@ void handleTestEvent() {
   }
   if     (type=="sub")  printEvent(tCfg,"TestUser","","");
   else if(type=="bit")  printEvent(tCfg,"TestUser","1000","");
-  else if(type=="pts")  printEvent(tCfg,"TestUser","","Hydrate :>");
+  else if(type=="pts")  printEvent(tCfg,"TestUser","","Hydrate :> ツ");
   else if(type=="raid") printEvent(tCfg,"TestUser","","");
   server.send(200,"text/plain","Test Sent");
 }
@@ -865,7 +915,7 @@ void handleTestEvent() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\nESP32-C3 Thermal Printer (U8g2 Font Mode)");
+  Serial.println("\n\nESP32-C3 Thermal Printer (Unicode Fallback Mode)");
   loadConfig();
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
