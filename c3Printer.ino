@@ -241,15 +241,12 @@ String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont, co
       uint32_t cp = nextCodepoint(line, i);
       bool useFallback = !isLatinCodepoint(cp);
       // Collect run of same font type
-      String seg = line.substring(segStart, i);
-      int segEnd = i;
       while (i < len) {
         int before = i;
         uint32_t cp2 = nextCodepoint(line, i);
         if (!isLatinCodepoint(cp2) != useFallback) { i = before; break; }
-        segEnd = i;
       }
-      seg = line.substring(segStart, segEnd > segStart ? segEnd : i);
+      String seg = line.substring(segStart, i);
       u8m.setFont(useFallback ? (se ? se->unicodeFallback : UNICODE_FALLBACK_FONT) : primaryFont);
       total += u8m.getUTF8Width(seg.c_str());
     }
@@ -371,7 +368,7 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
   // Render at 1/PRINT_SCALE width, then scale up by repeating pixels/rows.
   // This gives clean crisp scaling for bitmap fonts (avoids blurry stretching).
   int renderW       = PRINTER_WIDTH / PRINT_SCALE;
-  int maxTextWidth  = renderW - 4;
+  int maxTextWidth  = renderW - 8;
   text = wordWrap(text, maxTextWidth, primaryFont, se);
 
   int totalLines = 1;
@@ -432,6 +429,8 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
           u8m.setFont(fb ? se->unicodeFallback : primaryFont);
           tw += u8m.getUTF8Width(seg.c_str());
         }
+
+        tw = min(tw, renderW - 4);
 
         int x = 2;
         if     (align == 1) x = max(2, (renderW - tw) / 2);
