@@ -371,7 +371,7 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
   // Render at 1/PRINT_SCALE width, then scale up by repeating pixels/rows.
   // This gives clean crisp scaling for bitmap fonts (avoids blurry stretching).
   int renderW       = PRINTER_WIDTH / PRINT_SCALE;
-  int maxTextWidth  = renderW - 6;
+  int maxTextWidth  = renderW - 4;
   text = wordWrap(text, maxTextWidth, primaryFont, se);
 
   int totalLines = 1;
@@ -434,7 +434,7 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
         }
 
         int x = 2;
-        if     (align == 1) x = max(0, (renderW - tw) / 2);
+        if     (align == 1) x = max(2, (renderW - tw) / 2);
         else if(align == 2) x = max(2, renderW - tw - 2);
 
         drawLineMixed(u8g2, line, x, drawY, fgColor, primaryFont, bold, se);
