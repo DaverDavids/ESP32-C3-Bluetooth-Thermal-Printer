@@ -966,6 +966,7 @@ void setup() {
   loadConfig();
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(MYSSID, MYPSK);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
