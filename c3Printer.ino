@@ -46,6 +46,7 @@ size_t uploadExpectedSize = 0;
 size_t uploadWrittenBytes = 0;
 bool uploadFailed = false;
 bool uploadInProgress = false;
+unsigned long lastUploadFinish = 0;
 
 #define LOG_BUF_SIZE 8192
 char logBuffer[LOG_BUF_SIZE];
@@ -566,6 +567,11 @@ void parseTwitchMessage(String msg) {
 }
 
 void connectTwitch() {
+  if (ESP.getMaxAllocHeap() < 30000) {
+    logMsg("Twitch connect SKIPPED: heap too low (maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
+    twitchConnected = false;
+    return;
+  }
   logMsg("Connecting to Twitch IRC...");
   twitchClient.setInsecure();
   if(twitchClient.connect("irc.chat.twitch.tv", 6697)) {
@@ -619,6 +625,11 @@ class MyClientCallback : public BLEClientCallbacks {
 };
 
 void connectPrinter() {
+  if (ESP.getFreeHeap() < 40000 || ESP.getMaxAllocHeap() < 30000) {
+    logMsg("BLE connect SKIPPED: heap too low (free=" + String(ESP.getFreeHeap()) +
+           " maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
+    return;
+  }
   logMsg("Connecting: " + printerMAC);
   BLEDevice::init("ESP32-C3-Printer");
   if(pClient) delete pClient;
@@ -806,6 +817,7 @@ void handleFirmwareUpload() {
     }
   }
   else if (upload.status == UPLOAD_FILE_END) {
+    lastUploadFinish = millis();
     if (Update.end(true)) {
       logMsg("Firmware update SUCCESS, total " + String(upload.totalSize) + " bytes, rebooting");
     } else {
@@ -875,6 +887,7 @@ void handleUpload() {
     if (uploadFile) uploadFile.close();
     logMsg("Upload end: " + String(uploadWrittenBytes) + " bytes written");
     uploadInProgress = false;
+    lastUploadFinish = millis();
     if (uploadWrittenBytes == 0) {
       uploadFailed = true;
       logMsg("Upload wrote zero bytes");
@@ -901,26 +914,33 @@ void handleUploadComplete() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  logMsg("\n\nESP32-C3 Thermal Printer (VLW LittleFS Fonts)");
-  if (!LittleFS.begin(true)) {   // true = format if mount fails
+  logMsg("Boot. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
+  if (!LittleFS.begin(true)) {
     logMsg("LittleFS mount failed even after format attempt");
   } else {
     logMsg("LittleFS mounted OK");
   }  logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
+  logMsg("After LittleFS. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   loadConfig();
+  logMsg("After loadConfig. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   // NOTE: partitions.csv: app0 + app1 (1.5MB each) + spiffs ~960KB
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
+  logMsg("After VLW load. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(MYSSID, MYPSK);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   logMsg("\nWiFi OK: " + WiFi.localIP().toString());
+  logMsg("After WiFi connect. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS: http://c3printer.local"); }
+  logMsg("After mDNS. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
+  logMsg("After ArduinoOTA. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   connectTwitch();
+  logMsg("After Twitch attempt. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
   server.on("/gcfg",     handleGetConfig);
@@ -1035,11 +1055,12 @@ void loop() {
       if (dt > 50000) logMsg("WARN: handleTwitchIRC took " + String(dt) + " us");
     }
     else if(now - lastTwitchRetry > 10000) { lastTwitchRetry = now; connectTwitch(); }
-    // BLE auto-retry disabled — manual only via /c (Connect Printer button)
-    // if (bleState == BLE_IDLE && !printerConnected && now - lastPrinterRetry > 15000) {
-    //   lastPrinterRetry = now;
-    //   connectPrinter();
-    // }
+    if (bleState == BLE_IDLE && !printerConnected &&
+        now - lastPrinterRetry > 15000 &&
+        now - lastUploadFinish > 10000) {
+      lastPrinterRetry = now;
+      connectPrinter();
+    }
     if (bleState == BLE_DISCOVERING) {
       static unsigned long discoverStart = 0;
       if (discoverStart == 0) discoverStart = now;
