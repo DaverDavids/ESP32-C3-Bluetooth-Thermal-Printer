@@ -35,18 +35,16 @@ bool shouldSaveConfig = false;
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
-// ========== PRINT SCALE ==========
-// PRINT_SCALE 1 = 16px on paper (Small)
-// PRINT_SCALE 2 = 32px on paper (Medium, default)
-// PRINT_SCALE 3 = 48px on paper (Large)
+// PRINT_SCALE: base multiplier (default 2). EventConfig.font[] stores the
+// per-line override (1=Small/16px, 2=Medium/32px, 3=Large/48px on paper).
 #define PRINT_SCALE 2
 
-// Scale IDs used in EventConfig.font[]
 #define SCALE_SMALL  1
 #define SCALE_MEDIUM 2
 #define SCALE_LARGE  3
 
 // ========== VLW FONT STRUCTS ==========
+// Defined first — referenced by loadVlw/drawGlyph which come after PrintCanvas.
 
 struct VlwGlyph {
   uint32_t cp;
@@ -55,8 +53,8 @@ struct VlwGlyph {
 };
 
 struct VlwFont {
-  int      count;
-  int      size;
+  int       count;
+  int       size;
   VlwGlyph* glyphs;
   uint8_t*  bitmaps;
   size_t    bitmapBytes;
@@ -66,105 +64,40 @@ struct VlwFont {
 VlwFont fontBasic = {0};
 VlwFont fontCJK   = {0};
 
-// ========== VLW LOADER ==========
+// ========== BITMAP CANVAS ==========
+// Must be defined before drawGlyph.
 
-bool loadVlw(VlwFont& f, const char* path) {
-  File file = SPIFFS.open(path, "r");
-  if (!file) { Serial.printf("VLW missing: %s\n", path); return false; }
+class PrintCanvas : public Adafruit_GFX {
+public:
+  uint8_t *buffer;
+  int bufferSize;
 
-  auto read32 = [&]() -> int32_t {
-    uint8_t b[4]; file.read(b, 4);
-    return (b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
-  };
-
-  f.count  = read32();
-  int ver  = read32();
-  f.size   = read32();
-  read32(); read32(); read32(); // reserved
-
-  f.glyphs = (VlwGlyph*)malloc(f.count * sizeof(VlwGlyph));
-  if (!f.glyphs) { file.close(); return false; }
-
-  for (int i = 0; i < f.count; i++) {
-    f.glyphs[i].cp      = (uint32_t)read32();
-    f.glyphs[i].h       = (int16_t)read32();
-    f.glyphs[i].w       = (int16_t)read32();
-    f.glyphs[i].advance = (int16_t)read32();
-    f.glyphs[i].x_off   = (int16_t)read32();
-    f.glyphs[i].y_off   = (int16_t)read32();
+  PrintCanvas(int16_t w, int16_t h) : Adafruit_GFX(w, h) {
+    bufferSize = (w / 8) * h;
+    buffer = (uint8_t*)malloc(bufferSize);
+    if(buffer) memset(buffer, 0, bufferSize);
   }
+  ~PrintCanvas() { if(buffer) free(buffer); }
 
-  // Read all bitmaps into heap
-  f.bitmapBytes = file.size() - file.position();
-  f.bitmaps = (uint8_t*)malloc(f.bitmapBytes);
-  if (!f.bitmaps) { free(f.glyphs); file.close(); return false; }
-  file.read(f.bitmaps, f.bitmapBytes);
-  file.close();
-
-  // Compute bitmap offsets per glyph
-  size_t offset = 0;
-  for (int i = 0; i < f.count; i++) {
-    f.glyphs[i].bitmapOffset = offset;
-    int rowBytes = (f.glyphs[i].w + 7) / 8;
-    offset += rowBytes * f.glyphs[i].h;
+  void drawPixel(int16_t x, int16_t y, uint16_t color) override {
+    if(!buffer || x < 0 || x >= _width || y < 0 || y >= _height) return;
+    int byteIndex = (y * (_width / 8)) + (x / 8);
+    int bitIndex  = 7 - (x % 8);
+    if(color) buffer[byteIndex] |=  (1 << bitIndex);
+    else       buffer[byteIndex] &= ~(1 << bitIndex);
   }
-
-  f.loaded = true;
-  Serial.printf("VLW loaded: %s (%d glyphs)\n", path, f.count);
-  return true;
-}
-
-// ========== GLYPH LOOKUP ==========
-
-// Binary search — glyphs are stored in codepoint order from make_vlw.py
-const VlwGlyph* findGlyph(const VlwFont& f, uint32_t cp) {
-  if (!f.loaded) return nullptr;
-  int lo = 0, hi = f.count - 1;
-  while (lo <= hi) {
-    int mid = (lo + hi) / 2;
-    if      (f.glyphs[mid].cp == cp) return &f.glyphs[mid];
-    else if (f.glyphs[mid].cp  < cp) lo = mid + 1;
-    else                              hi = mid - 1;
-  }
-  return nullptr;
-}
-
-// Returns glyph + source font pointer; checks basic first, then CJK
-const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
-  const VlwGlyph* g = findGlyph(fontBasic, cp);
-  if (g) { if (outFont) *outFont = &fontBasic; return g; }
-  g = findGlyph(fontCJK, cp);
-  if (g) { if (outFont) *outFont = &fontCJK;   return g; }
-  if (outFont) *outFont = nullptr;
-  return nullptr;
-}
-
-// Draw one glyph into PrintCanvas at (x, baseline_y). Returns advance width.
-int drawGlyph(PrintCanvas& canvas, const VlwFont& font, const VlwGlyph* g,
-              int x, int baseline_y, bool invert) {
-  if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
-  int rowBytes = (g->w + 7) / 8;
-  const uint8_t* bmp = font.bitmaps + g->bitmapOffset;
-  for (int row = 0; row < g->h; row++) {
-    int py = baseline_y + g->y_off + row;
-    for (int col = 0; col < g->w; col++) {
-      int px = x + g->x_off + col;
-      uint8_t byte = bmp[row * rowBytes + col / 8];
-      bool set = (byte >> (7 - (col % 8))) & 1;
-      if (set) canvas.drawPixel(px, py, invert ? 0 : 1);
-    }
-  }
-  return g->advance;
-}
+  void clear() { if(buffer) memset(buffer, 0, bufferSize); }
+};
 
 // ========== STRUCTS ==========
+// Defined before initDefaults() and printEvent().
 
 struct EventConfig {
   bool    enabled = true;
   String  msg[3];
-  uint8_t font[3];   // stores SCALE_* value (1=Small, 2=Medium, 3=Large)
+  uint8_t font[3];   // SCALE_SMALL/MEDIUM/LARGE
   int     align[3];
-  bool    bold[3];   // retained in config; bold is cosmetic (not used by VLW path)
+  bool    bold[3];
   bool    invert[3];
   int     feed = 3;
 };
@@ -207,29 +140,93 @@ void initDefaults() {
   }
 }
 
-// ========== BITMAP CANVAS ==========
+// ========== VLW LOADER ==========
 
-class PrintCanvas : public Adafruit_GFX {
-public:
-  uint8_t *buffer;
-  int bufferSize;
+bool loadVlw(VlwFont& f, const char* path) {
+  File file = SPIFFS.open(path, "r");
+  if (!file) { Serial.printf("VLW missing: %s\n", path); return false; }
 
-  PrintCanvas(int16_t w, int16_t h) : Adafruit_GFX(w, h) {
-    bufferSize = (w / 8) * h;
-    buffer = (uint8_t*)malloc(bufferSize);
-    if(buffer) memset(buffer, 0, bufferSize);
+  auto read32 = [&]() -> int32_t {
+    uint8_t b[4]; file.read(b, 4);
+    return (b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+  };
+
+  f.count  = read32();
+  int ver  = read32();
+  f.size   = read32();
+  read32(); read32(); read32(); // reserved
+
+  f.glyphs = (VlwGlyph*)malloc(f.count * sizeof(VlwGlyph));
+  if (!f.glyphs) { file.close(); return false; }
+
+  for (int i = 0; i < f.count; i++) {
+    f.glyphs[i].cp      = (uint32_t)read32();
+    f.glyphs[i].h       = (int16_t)read32();
+    f.glyphs[i].w       = (int16_t)read32();
+    f.glyphs[i].advance = (int16_t)read32();
+    f.glyphs[i].x_off   = (int16_t)read32();
+    f.glyphs[i].y_off   = (int16_t)read32();
   }
-  ~PrintCanvas() { if(buffer) free(buffer); }
 
-  void drawPixel(int16_t x, int16_t y, uint16_t color) override {
-    if(!buffer || x < 0 || x >= _width || y < 0 || y >= _height) return;
-    int byteIndex = (y * (_width / 8)) + (x / 8);
-    int bitIndex  = 7 - (x % 8);
-    if(color) buffer[byteIndex] |=  (1 << bitIndex);
-    else       buffer[byteIndex] &= ~(1 << bitIndex);
+  f.bitmapBytes = file.size() - file.position();
+  f.bitmaps = (uint8_t*)malloc(f.bitmapBytes);
+  if (!f.bitmaps) { free(f.glyphs); file.close(); return false; }
+  file.read(f.bitmaps, f.bitmapBytes);
+  file.close();
+
+  size_t offset = 0;
+  for (int i = 0; i < f.count; i++) {
+    f.glyphs[i].bitmapOffset = offset;
+    int rowBytes = (f.glyphs[i].w + 7) / 8;
+    offset += rowBytes * f.glyphs[i].h;
   }
-  void clear() { if(buffer) memset(buffer, 0, bufferSize); }
-};
+
+  f.loaded = true;
+  Serial.printf("VLW loaded: %s (%d glyphs)\n", path, f.count);
+  return true;
+}
+
+// ========== GLYPH LOOKUP + DRAW ==========
+
+const VlwGlyph* findGlyph(const VlwFont& f, uint32_t cp) {
+  if (!f.loaded) return nullptr;
+  int lo = 0, hi = f.count - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    if      (f.glyphs[mid].cp == cp) return &f.glyphs[mid];
+    else if (f.glyphs[mid].cp  < cp) lo = mid + 1;
+    else                              hi = mid - 1;
+  }
+  return nullptr;
+}
+
+// Returns glyph + owning font pointer; basic first, then CJK.
+const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
+  const VlwGlyph* g = findGlyph(fontBasic, cp);
+  if (g) { if (outFont) *outFont = &fontBasic; return g; }
+  g = findGlyph(fontCJK, cp);
+  if (g) { if (outFont) *outFont = &fontCJK;   return g; }
+  if (outFont) *outFont = nullptr;
+  return nullptr;
+}
+
+// Draw one glyph into PrintCanvas at (x, baseline_y). Returns advance width.
+int drawGlyph(PrintCanvas& canvas, const VlwFont& font, const VlwGlyph* g,
+              int x, int baseline_y, bool invert) {
+  if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
+  int rowBytes = (g->w + 7) / 8;
+  const uint8_t* bmp = font.bitmaps + g->bitmapOffset;
+  for (int row = 0; row < g->h; row++) {
+    int py = baseline_y + g->y_off + row;
+    for (int col = 0; col < g->w; col++) {
+      int px = x + g->x_off + col;
+      uint8_t byte = bmp[row * rowBytes + col / 8];
+      bool set = (byte >> (7 - (col % 8))) & 1;
+      if (set) canvas.drawPixel(px, py, invert ? 0 : 1);
+    }
+  }
+  return g->advance;
+}
 
 // ========== TEXT PROCESSING ==========
 
@@ -239,7 +236,6 @@ String processNewlines(String text) {
   return text;
 }
 
-// Pass through valid UTF-8 sequences; strip bare control chars
 String sanitizeText(String text) {
   String result = "";
   int i = 0, len = (int)text.length();
@@ -269,17 +265,16 @@ String sanitizeText(String text) {
         result+=text[i]; result+=text[i+1]; i+=2;
       } else { i++; }
     } else {
-      i++; // lone continuation byte, skip
+      i++;
     }
   }
   return result;
 }
 
-// Decode one UTF-8 codepoint, advance index
 uint32_t nextCodepoint(const String& s, int& i) {
   unsigned char c = (unsigned char)s[i];
   if (c < 0x80)  { i++; return c; }
-  if (c < 0xC0)  { i++; return 0xFFFD; } // lone continuation
+  if (c < 0xC0)  { i++; return 0xFFFD; }
   if (c < 0xE0)  { uint32_t cp = (c & 0x1F); i++; if(i<(int)s.length()) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
   if (c < 0xF0)  { uint32_t cp = (c & 0x0F); i++; for(int j=0;j<2&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
   { uint32_t cp = (c & 0x07); i++; for(int j=0;j<3&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
@@ -287,7 +282,6 @@ uint32_t nextCodepoint(const String& s, int& i) {
 
 // ========== VLW WORD WRAP ==========
 
-// Measure a string's rendered width using VLW glyph advances
 int measureTextVlw(const String& text) {
   int total = 0, i = 0, len = (int)text.length();
   while (i < len) {
@@ -295,7 +289,7 @@ int measureTextVlw(const String& text) {
     const VlwFont* srcFont = nullptr;
     const VlwGlyph* g = getGlyph(cp, &srcFont);
     if (g) total += g->advance;
-    else   total += fontBasic.size / 2; // fallback estimate for missing glyphs
+    else   total += fontBasic.size / 2;
   }
   return total;
 }
@@ -376,17 +370,15 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
 
   text = processNewlines(text);
 
-  // Clamp scale to valid range
   if (printScale < 1) printScale = 1;
   if (printScale > 3) printScale = 3;
 
-  // VLW native size is 16px; render at renderW then scale up
   const int vlwSize    = (fontBasic.loaded ? fontBasic.size : 16);
   const int renderW    = PRINTER_WIDTH / printScale;
   const int maxTextW   = renderW - 8;
   const int lineSpacing = 3;
   const int lineHeight  = vlwSize + lineSpacing;
-  const int baseline    = vlwSize; // y offset within a line to the glyph baseline
+  const int baseline    = vlwSize;
 
   text = wordWrap(text, maxTextW);
 
@@ -417,14 +409,12 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
       String line = text.substring(textIndex, lineEnd);
 
       if(line.length() > 0) {
-        // Measure line width for alignment
         int tw = min(measureTextVlw(line), renderW - 4);
 
         int x = 2;
         if     (align == 1) x = max(2, (renderW - tw) / 2);
         else if(align == 2) x = max(2, renderW - tw - 2);
 
-        // Draw each codepoint
         int ci = 0, clen = (int)line.length();
         while (ci < clen) {
           uint32_t cp = nextCodepoint(line, ci);
@@ -433,9 +423,9 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
           if (g && srcFont) {
             x += drawGlyph(canvas, *srcFont, g, x, drawY, invert);
           } else {
-            x += vlwSize / 2; // advance past missing glyph
+            x += vlwSize / 2;
           }
-          if (x >= renderW - 2) break; // overrun guard
+          if (x >= renderW - 2) break;
         }
       }
 
@@ -443,7 +433,6 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
       textIndex = lineEnd + 1;
     }
 
-    // Scale up: repeat each row and column printScale times for crisp output
     {
       int scaledH      = chunkHeight * printScale;
       int scaledWBytes = PRINTER_WIDTH / 8;
