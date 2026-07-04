@@ -31,6 +31,10 @@ unsigned long lastTwitchPing = 0;
 
 String pointsRewardFilter = "";
 bool shouldSaveConfig = false;
+File uploadFile;
+size_t uploadExpectedSize = 0;
+size_t uploadWrittenBytes = 0;
+bool uploadFailed = false;
 
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
@@ -704,7 +708,7 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 
 <div class="card">
   <h2>Manual Test Print</h2>
-  <textarea id="t_txt">Hello! Caf&#233; resum&#233; na&#239;ve &#1055;&#1088;&#1080;&#1074;&#1077;&#1090; &#12484;</textarea>
+  <textarea id="t_txt">Hello! Caf&#233; resum&#233; na&#239;ve &#1055;&#1088;&#1080;&#1074;&#1077;&#1090; &#12484; ¯\_(ツ)_/¯ 🤷</textarea>
   <div class="line-row" style="margin-top:6px">
     <div class="ctl size-ctl">
       <select id="t_s"></select>
@@ -720,6 +724,18 @@ textarea{height:56px;resize:vertical;font-family:monospace}
   <div class="feed-row">
     <button class="print-btn" onclick="testPrint()">&#128424; Print</button>
     <button class="feed-btn" onclick="feed()">&#128196; Feed 3</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Upload Font Files</h2>
+  <form id="fontForm">
+    <input type="file" id="fontFiles" multiple accept=".vlw">
+    <button type="button" onclick="uploadFonts()" class="save">Upload to SPIFFS</button>
+    <div id="uploadStatus" style="font-size:11px;margin-top:6px"></div>
+  </form>
+  <div style="margin-top:8px;font-size:12px;color:#9ca3af">
+    <a href="/spiffs_check" target="_blank" style="color:#a78bfa">Check uploaded files</a>
   </div>
 </div>
 
@@ -840,6 +856,24 @@ function testPrint() {
 function feed()      { fetch('/f?lines=3'); }
 function doConnect() { fetch('/c').then(r=>r.text()).then(alert); }
 
+async function uploadFonts() {
+  const files = document.getElementById('fontFiles').files;
+  const status = document.getElementById('uploadStatus');
+  status.innerHTML = '';
+  for (const file of files) {
+    status.innerHTML += `Uploading ${file.name} (${file.size} bytes)...<br>`;
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: fd });
+      const text = await res.text();
+      status.innerHTML += `${file.name}: ${text}<br>`;
+    } catch (e) {
+      status.innerHTML += `${file.name}: FAILED — ${e}<br>`;
+    }
+  }
+}
+
 setInterval(()=>{
   fetch('/s').then(r=>r.json()).then(d=>{
     let ps=document.getElementById('ps'),ts=document.getElementById('ts');
@@ -947,16 +981,74 @@ void handleTestEvent() {
   server.send(200,"text/plain","Test Sent");
 }
 
+// ========== FILE UPLOAD ==========
+
+void handleUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = "/" + upload.filename;
+    Serial.printf("Upload start: %s\n", filename.c_str());
+
+    size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+    Serial.printf("SPIFFS free: %u bytes\n", freeBytes);
+
+    if (SPIFFS.exists(filename)) SPIFFS.remove(filename);
+    uploadFile = SPIFFS.open(filename, "w");
+    uploadWrittenBytes = 0;
+    uploadFailed = false;
+
+    if (!uploadFile) {
+      Serial.println("Failed to open file for writing");
+      uploadFailed = true;
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile && !uploadFailed) {
+      size_t written = uploadFile.write(upload.buf, upload.currentSize);
+      uploadWrittenBytes += written;
+      if (written != upload.currentSize) {
+        Serial.printf("WRITE MISMATCH: expected %u, wrote %u\n",
+                      upload.currentSize, written);
+        uploadFailed = true;
+      }
+    }
+    yield();
+  }
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) uploadFile.close();
+    Serial.printf("Upload end. Total written: %u / expected %u\n",
+                  uploadWrittenBytes, upload.totalSize);
+    if (uploadWrittenBytes != upload.totalSize) {
+      uploadFailed = true;
+      Serial.println("SIZE MISMATCH — upload incomplete!");
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Serial.println("Upload ABORTED by client");
+    uploadFailed = true;
+    if (uploadFile) uploadFile.close();
+  }
+}
+
+void handleUploadComplete() {
+  if (uploadFailed) {
+    server.send(500, "text/plain", "Upload FAILED — file incomplete or write error. Check Serial log.");
+  } else {
+    server.send(200, "text/plain", "Upload OK: " + String(uploadWrittenBytes) + " bytes written.");
+  }
+}
+
 // ========== SETUP & LOOP ==========
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n\nESP32-C3 Thermal Printer (VLW SPIFFS Fonts)");
-  loadConfig();
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed");
   }
+  loadConfig();
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
   WiFi.mode(WIFI_STA);
@@ -978,6 +1070,17 @@ void setup() {
   server.on("/f",        handleFeed);
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
+  server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
+  server.on("/spiffs_check", []() {
+    String out = "SPIFFS files:\n";
+    File root = SPIFFS.open("/");
+    File f = root.openNextFile();
+    while (f) {
+      out += String(f.name()) + " - " + String(f.size()) + " bytes\n";
+      f = root.openNextFile();
+    }
+    server.send(200, "text/plain", out);
+  });
   server.begin();
   Serial.println("Ready!");
 }
