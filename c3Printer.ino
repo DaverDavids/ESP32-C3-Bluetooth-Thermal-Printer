@@ -781,60 +781,30 @@ void handleTestEvent() {
 
 // ========== FIRMWARE UPDATE ==========
 
-void handleFirmwareUploadStream() {
-  WiFiClient client = server.client();
+void handleFirmwareUpload() {
+  HTTPUpload& upload = server.upload();
 
-  String line;
-  size_t contentLength = 0;
-  while (client.connected()) {
-    line = client.readStringUntil('\n');
-    line.trim();
-    if (line.startsWith("Content-Length:")) {
-      contentLength = line.substring(16).toInt();
+  if (upload.status == UPLOAD_FILE_START) {
+    logMsg("Firmware upload start: " + upload.filename + " free heap " + String(ESP.getFreeHeap()));
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      logMsg("Update.begin failed: " + String(Update.errorString()));
     }
-    if (line.length() == 0) break;
   }
-
-  logMsg("Firmware upload start, expecting " + String(contentLength) + " bytes, free heap " + String(ESP.getFreeHeap()));
-
-  if (contentLength == 0) {
-    client.println("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-    logMsg("Firmware upload ERROR: no Content-Length");
-    return;
-  }
-
-  if (!Update.begin(contentLength, U_FLASH)) {
-    logMsg("Update.begin failed: " + String(Update.errorString()));
-    client.println("HTTP/1.1 500 Fail\r\nContent-Length: 0\r\n\r\n");
-    return;
-  }
-
-  size_t written = 0;
-  uint8_t buf[512];
-  while (written < contentLength && client.connected()) {
-    size_t avail = client.available();
-    if (avail) {
-      size_t toRead = min(avail, sizeof(buf));
-      size_t got = client.read(buf, toRead);
-      Update.write(buf, got);
-      written += got;
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      logMsg("Update.write failed: " + String(Update.errorString()));
     }
-    yield();
   }
-
-  bool ok = (written == contentLength) && Update.end(true);
-  logMsg(ok ? "Firmware update SUCCESS, rebooting"
-            : ("Firmware update FAILED: " + String(Update.errorString()) + " written " + String(written) + "/" + String(contentLength)));
-
-  if (ok) {
-    client.print("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
-    client.stop();
-    delay(300);
-    ESP.restart();
-  } else {
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      logMsg("Firmware update SUCCESS, total " + String(upload.totalSize) + " bytes, rebooting");
+    } else {
+      logMsg("Update.end failed: " + String(Update.errorString()));
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
-    client.print("HTTP/1.1 500 Fail\r\nContent-Length: 0\r\n\r\n");
-    client.stop();
+    logMsg("Firmware upload ABORTED");
   }
 }
 
@@ -937,7 +907,15 @@ void setup() {
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
-  server.on("/ota_upload", HTTP_POST, [](){}, handleFirmwareUploadStream);
+  server.on("/ota_upload", HTTP_POST,
+    [](){
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
+      delay(300);
+      ESP.restart();
+    },
+    handleFirmwareUpload
+  );
   server.on("/fsinfo", []() {
     size_t total = LittleFS.totalBytes();
     size_t used  = LittleFS.usedBytes();

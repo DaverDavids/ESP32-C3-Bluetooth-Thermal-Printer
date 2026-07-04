@@ -232,12 +232,14 @@ async function uploadFirmware() {
   const status = document.getElementById('fwStatus');
   if (!file) { status.textContent = 'Select a .bin file first'; return; }
   status.textContent = `Uploading ${file.name} (${file.size} bytes)...`;
+  const formData = new FormData();
+  formData.append('firmware', file, file.name);
   try {
-    const res = await fetch('/ota_upload', { method: 'POST', body: file });
+    const res = await fetch('/ota_upload', { method: 'POST', body: formData });
     const text = await res.text();
     status.textContent = res.ok ? 'Update OK — rebooting...' : ('Failed: ' + text);
   } catch (e) {
-    status.textContent = 'Upload error: ' + e;
+    status.textContent = 'Upload error (device likely rebooting): ' + e;
   }
 }
 
