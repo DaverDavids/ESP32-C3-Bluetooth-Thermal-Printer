@@ -108,14 +108,12 @@ make_vlw(
     ]
 )
 
-# CJK file — no emoji needed here
 make_vlw(
     ttf_paths=["unifont-17.0.05.otf"],
     size=16,
     output_path="unifont_cjk.vlw",
     codepoint_ranges=[
-        (0x3040, 0x30FF),
-        (0x4E00, 0x9FFF),
-#        (0x4E00–0x7FFF), #trimmed
+        (0x3040, 0x30FF),   # Hiragana + Katakana (unchanged)
+        (0x4E00, 0x62FF),   # Most frequent ~5,600 CJK ideographs by block position
     ]
 )

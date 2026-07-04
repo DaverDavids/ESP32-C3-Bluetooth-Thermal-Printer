@@ -4,12 +4,12 @@
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <ArduinoOTA.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEClient.h>
 #include <Adafruit_GFX.h>
 #include <LittleFS.h>
-#include "esp_ota_ops.h"
 #include <Secrets.h>
 #include "html.h"
 
@@ -786,7 +786,16 @@ void handleFirmwareUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
-    logMsg("Firmware upload start: " + upload.filename + " free heap " + String(ESP.getFreeHeap()));
+    if (printerConnected || bleState == BLE_CONNECTING || bleState == BLE_DISCOVERING) {
+      logMsg("Disconnecting BLE before firmware upload");
+      disconnectPrinter();
+      delay(200);
+    }
+    logMsg("Firmware upload start: " + upload.filename + " free heap " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
+    if (ESP.getMaxAllocHeap() < 20000) {
+      logMsg("REJECTED firmware upload: MaxAlloc too low (" + String(ESP.getMaxAllocHeap()) + " bytes)");
+      return;
+    }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
       logMsg("Update.begin failed: " + String(Update.errorString()));
     }
@@ -815,6 +824,18 @@ void handleUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    if (printerConnected || bleState == BLE_CONNECTING || bleState == BLE_DISCOVERING) {
+      logMsg("Disconnecting BLE before upload to free heap");
+      disconnectPrinter();
+      delay(200);
+    }
+    logMsg("Free heap before upload: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
+    if (ESP.getMaxAllocHeap() < 20000) {
+      logMsg("REJECTED upload: MaxAlloc too low (" + String(ESP.getMaxAllocHeap()) + " bytes) — reboot device first");
+      uploadFailed = true;
+      return;
+    }
+
     String filename = "/" + upload.filename;
     logMsg("Upload start: " + filename);
 
@@ -852,11 +873,11 @@ void handleUpload() {
   }
   else if (upload.status == UPLOAD_FILE_END) {
     if (uploadFile) uploadFile.close();
-    logMsg("Upload end. Total written: " + String(uploadWrittenBytes) + " / expected " + String(upload.totalSize));
+    logMsg("Upload end: " + String(uploadWrittenBytes) + " bytes written");
     uploadInProgress = false;
-    if (uploadWrittenBytes != upload.totalSize) {
+    if (uploadWrittenBytes == 0) {
       uploadFailed = true;
-      logMsg("SIZE MISMATCH — upload incomplete!");
+      logMsg("Upload wrote zero bytes");
     }
   }
   else if (upload.status == UPLOAD_FILE_ABORTED) {
@@ -887,7 +908,7 @@ void setup() {
     logMsg("LittleFS mounted OK");
   }  logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
   loadConfig();
-  // NOTE: partitions.csv: factory 256KB + ota_0 1.5MB + spiffs ~2.19MB
+  // NOTE: partitions.csv: app0 + app1 (1.5MB each) + spiffs ~960KB
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
   WiFi.mode(WIFI_STA);
@@ -897,6 +918,8 @@ void setup() {
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   logMsg("\nWiFi OK: " + WiFi.localIP().toString());
   if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS: http://c3printer.local"); }
+  ArduinoOTA.setHostname(hostname);
+  ArduinoOTA.begin();
   connectTwitch();
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
@@ -908,19 +931,6 @@ void setup() {
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
-  server.on("/enter_update_mode", HTTP_POST, [](){
-    server.send(200, "text/plain", "Rebooting into update mode...");
-    delay(300);
-    const esp_partition_t* factory_part = esp_partition_find_first(
-      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-    if (factory_part) {
-      esp_ota_set_boot_partition(factory_part);
-      ESP.restart();
-    } else {
-      logMsg("ERROR: factory partition not found");
-    }
-  });
-
   server.on("/ota_upload", HTTP_POST,
     [](){
       server.sendHeader("Connection", "close");
@@ -1013,6 +1023,7 @@ void loop() {
     if (wifiStatus == WL_CONNECTED) logMsg("WiFi reconnected: " + WiFi.localIP().toString());
   }
 
+  ArduinoOTA.handle();
   if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
   static unsigned long lastTwitchRetry = 0, lastPrinterRetry = 0;
@@ -1024,10 +1035,11 @@ void loop() {
       if (dt > 50000) logMsg("WARN: handleTwitchIRC took " + String(dt) + " us");
     }
     else if(now - lastTwitchRetry > 10000) { lastTwitchRetry = now; connectTwitch(); }
-    if (bleState == BLE_IDLE && !printerConnected && now - lastPrinterRetry > 15000) {
-      lastPrinterRetry = now;
-      connectPrinter();
-    }
+    // BLE auto-retry disabled — manual only via /c (Connect Printer button)
+    // if (bleState == BLE_IDLE && !printerConnected && now - lastPrinterRetry > 15000) {
+    //   lastPrinterRetry = now;
+    //   connectPrinter();
+    // }
     if (bleState == BLE_DISCOVERING) {
       static unsigned long discoverStart = 0;
       if (discoverStart == 0) discoverStart = now;
