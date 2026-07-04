@@ -81,8 +81,12 @@ const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 #define SCALE_MEDIUM 2
 #define SCALE_LARGE  3
 
+// Static reusable glyph bitmap buffer — sized for the largest possible VLW glyph
+// (64x64 px = 512 bytes). Eliminates per-glyph malloc/free heap churn.
+#define MAX_GLYPH_BYTES 512
+static uint8_t glyphBuf[MAX_GLYPH_BYTES];
+
 // ========== VLW FONT STRUCTS ==========
-// Defined first — referenced by loadVlw/drawGlyph which come after PrintCanvas.
 
 struct VlwGlyph {
   uint32_t cp;
@@ -103,7 +107,6 @@ VlwFont fontBasic = {0};
 VlwFont fontCJK   = {0};
 
 // ========== BITMAP CANVAS ==========
-// Must be defined before drawGlyph.
 
 class PrintCanvas : public Adafruit_GFX {
 public:
@@ -128,7 +131,6 @@ public:
 };
 
 // ========== STRUCTS ==========
-// Defined before initDefaults() and printEvent().
 
 struct EventConfig {
   bool    enabled = true;
@@ -196,9 +198,9 @@ bool loadVlw(VlwFont& f, const char* path) {
 
   f.indexStart = file.position();
 
-  // Build compact bitmap-offset array (4 bytes per glyph) — avoids ~20 bytes/glyph of full index
+  // Build compact bitmap-offset array (4 bytes per glyph)
   f.bitmapOffsets = (uint32_t*)malloc(f.count * sizeof(uint32_t));
-  uint32_t bmpOff = f.indexStart + f.count * 24; // first bitmap position
+  uint32_t bmpOff = f.indexStart + f.count * 24;
   for (int i = 0; i < f.count; i++) {
     if (f.bitmapOffsets) f.bitmapOffsets[i] = bmpOff;
     read32(); // cp
@@ -216,14 +218,14 @@ bool loadVlw(VlwFont& f, const char* path) {
   return true;
 }
 
-// ========== GLYPH LOOKUP + DRAW ==========
+// ========== GLYPH LOOKUP ==========
 
-// Binary-search one glyph entry from the VLW file on LittleFS.
+// Binary-search one glyph entry using an already-open file handle.
+// The caller opens the file once per line/chunk and passes it in —
+// this avoids a file open/close per character during rendering.
 // Populates the caller-owned *out struct (including bitmapOffset).
-const VlwGlyph* findGlyphInFile(const VlwFont& f, uint32_t cp, VlwGlyph* out) {
-  if (!f.loaded || !f.bitmapOffsets) return nullptr;
-  File file = LittleFS.open(f.path, "r");
-  if (!file) return nullptr;
+const VlwGlyph* findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* out) {
+  if (!f.loaded || !f.bitmapOffsets) return nullptr;  // null-guard: font failed to load
 
   auto read32 = [&]() -> int32_t {
     uint8_t b[4]; file.read(b, 4);
@@ -242,57 +244,73 @@ const VlwGlyph* findGlyphInFile(const VlwFont& f, uint32_t cp, VlwGlyph* out) {
       out->advance = (int16_t)read32();
       out->x_off   = (int16_t)read32();
       out->y_off   = (int16_t)read32();
-      out->bitmapOffset = f.bitmapOffsets[mid];
-      file.close();
+      out->bitmapOffset = f.bitmapOffsets[mid];  // safe: null-guarded above
       return out;
     } else if (midCp < cp) lo = mid + 1;
     else                   hi = mid - 1;
   }
-  file.close();
   return nullptr;
 }
 
-// Returns glyph + owning font pointer using a single-entry static cache per font.
-// Callers consume the pointer immediately (before the next getGlyph call).
+// Lookup a glyph by opening the font file internally.
+// Used only for measurement passes (wordWrap / measureTextVlw) where
+// we don't yet have a render-time open file handle.
+// Returns pointer to a static per-font glyph struct — consume before next call.
 const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
   static VlwGlyph cacheBasic, cacheCJK;
-  if (findGlyphInFile(fontBasic, cp, &cacheBasic)) {
-    if (outFont) *outFont = &fontBasic;
-    return &cacheBasic;
+
+  if (fontBasic.loaded && fontBasic.bitmapOffsets) {
+    File fBasic = LittleFS.open(fontBasic.path, "r");
+    if (fBasic) {
+      if (findGlyphInOpenFile(fontBasic, fBasic, cp, &cacheBasic)) {
+        fBasic.close();
+        if (outFont) *outFont = &fontBasic;
+        return &cacheBasic;
+      }
+      fBasic.close();
+    }
   }
-  if (findGlyphInFile(fontCJK, cp, &cacheCJK)) {
-    if (outFont) *outFont = &fontCJK;
-    return &cacheCJK;
+
+  if (fontCJK.loaded && fontCJK.bitmapOffsets) {
+    File fCJK = LittleFS.open(fontCJK.path, "r");
+    if (fCJK) {
+      if (findGlyphInOpenFile(fontCJK, fCJK, cp, &cacheCJK)) {
+        fCJK.close();
+        if (outFont) *outFont = &fontCJK;
+        return &cacheCJK;
+      }
+      fCJK.close();
+    }
   }
+
   if (outFont) *outFont = nullptr;
   return nullptr;
 }
 
 // Draw one glyph into PrintCanvas at (x, baseline_y). Returns advance width.
-// Reads bitmap data from LittleFS on demand (not preloaded into RAM).
-int drawGlyph(PrintCanvas& canvas, const VlwFont& font, const VlwGlyph* g,
-              int x, int baseline_y, bool invert) {
+// Accepts an already-open File& for the font — no open/close per glyph.
+// Uses the static glyphBuf[] instead of malloc/free — zero heap churn.
+int drawGlyph(PrintCanvas& canvas, const VlwFont& font, File& fontFile,
+              const VlwGlyph* g, int x, int baseline_y, bool invert) {
   if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
   int rowBytes = (g->w + 7) / 8;
   int bmpBytes = rowBytes * g->h;
-  uint8_t* bmp = (uint8_t*)malloc(bmpBytes);
-  if (!bmp) return g->advance;
-  File f = LittleFS.open(font.path, "r");
-  if (f) {
-    f.seek(g->bitmapOffset);
-    f.read(bmp, bmpBytes);
-    f.close();
+  if (bmpBytes > MAX_GLYPH_BYTES) {
+    // Glyph too large for static buffer — skip drawing but still advance
+    logMsg("WARN: glyph too large for glyphBuf, skipping");
+    return g->advance;
   }
+  fontFile.seek(g->bitmapOffset);
+  fontFile.read(glyphBuf, bmpBytes);
   for (int row = 0; row < g->h; row++) {
     int py = baseline_y + g->y_off + row;
     for (int col = 0; col < g->w; col++) {
       int px = x + g->x_off + col;
-      uint8_t byte = bmp[row * rowBytes + col / 8];
+      uint8_t byte = glyphBuf[row * rowBytes + col / 8];
       bool set = (byte >> (7 - (col % 8))) & 1;
       if (set) canvas.drawPixel(px, py, invert ? 0 : 1);
     }
   }
-  free(bmp);
   return g->advance;
 }
 
@@ -458,6 +476,12 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   int linesPerChunk = max(1, 200 / lineHeight);
   int currentLineIndex = 0, textIndex = 0;
 
+  // Open font files once per printToThermal call — shared across all chunks and glyphs.
+  // This is the primary fix: eliminates per-glyph file open/close overhead.
+  File fBasicHandle, fCJKHandle;
+  if (fontBasic.loaded && fontBasic.path) fBasicHandle = LittleFS.open(fontBasic.path, "r");
+  if (fontCJK.loaded   && fontCJK.path)   fCJKHandle   = LittleFS.open(fontCJK.path,   "r");
+
   while(currentLineIndex < totalLines) {
     int chunkLineCount = 0, chunkHeight = 0;
     if(currentLineIndex == 0) chunkHeight += lineSpacing * 2;
@@ -467,7 +491,7 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
     if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += lineSpacing * 2;
 
     PrintCanvas canvas(renderW, chunkHeight);
-    if(!canvas.buffer) { logMsg("Chunk alloc failed!"); return false; }
+    if(!canvas.buffer) { logMsg("Chunk alloc failed!"); break; }
 
     if(invert) canvas.fillRect(0, 0, renderW, chunkHeight, 1);
 
@@ -488,10 +512,28 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
         int ci = 0, clen = (int)line.length();
         while (ci < clen) {
           uint32_t cp = nextCodepoint(line, ci);
-          const VlwFont* srcFont = nullptr;
-          const VlwGlyph* g = getGlyph(cp, &srcFont);
-          if (g && srcFont) {
-            x += drawGlyph(canvas, *srcFont, g, x, drawY, invert);
+          VlwGlyph glyphOut;
+          const VlwGlyph* g = nullptr;
+          File* usedFile = nullptr;
+
+          // Try basic font first using the already-open handle
+          if (fBasicHandle && fontBasic.loaded && fontBasic.bitmapOffsets) {
+            if (findGlyphInOpenFile(fontBasic, fBasicHandle, cp, &glyphOut)) {
+              g = &glyphOut;
+              usedFile = &fBasicHandle;
+            }
+          }
+          // Fall back to CJK font
+          if (!g && fCJKHandle && fontCJK.loaded && fontCJK.bitmapOffsets) {
+            if (findGlyphInOpenFile(fontCJK, fCJKHandle, cp, &glyphOut)) {
+              g = &glyphOut;
+              usedFile = &fCJKHandle;
+            }
+          }
+
+          if (g && usedFile) {
+            x += drawGlyph(canvas, *usedFile == fBasicHandle ? fontBasic : fontCJK,
+                           *usedFile, g, x, drawY, invert);
           } else {
             x += vlwSize / 2;
           }
@@ -532,6 +574,10 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
     currentLineIndex += chunkLineCount;
     delay(20);
   }
+
+  // Close font file handles opened for this print job
+  if (fBasicHandle) fBasicHandle.close();
+  if (fCJKHandle)   fCJKHandle.close();
 
   if(feedLines > 0) feedPaper(feedLines);
   unsigned long dt = millis() - tStart;
@@ -948,7 +994,8 @@ void setup() {
     logMsg("LittleFS mount failed even after format attempt");
   } else {
     logMsg("LittleFS mounted OK");
-  }  logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
+  }
+  logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
   logMsg("After LittleFS. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   loadConfig();
   logMsg("After loadConfig. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
@@ -1032,7 +1079,6 @@ void setup() {
   server.on("/ping", []() {
     server.send(200, "text/plain", "pong");
   });
-
   server.on("/log", []() {
     server.send(200, "text/html", R"rawliteral(
 <!DOCTYPE html><html><head><title>Console</title>
@@ -1055,7 +1101,9 @@ tick();
 }
 
 void loop() {
-  static unsigned long lastHeapLog = 0, lastWiFiLog = 0;
+  static unsigned long lastHeapLog = 0;
+  // Delay first BLE attempt 30s to let Twitch TLS stabilize before competing for heap
+  static unsigned long lastPrinterRetry = 30000;
   unsigned long now = millis();
 
   if (now - lastHeapLog > 10000) {
@@ -1078,7 +1126,7 @@ void loop() {
   ArduinoOTA.handle();
   if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
-  static unsigned long lastTwitchRetry = 0, lastPrinterRetry = 0;
+  static unsigned long lastTwitchRetry = 0;
   if (!uploadInProgress) {
     if(twitchConnected) {
       unsigned long t0 = micros();
