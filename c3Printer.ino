@@ -937,6 +937,11 @@ tick();
 }
 
 void loop() {
+  static unsigned long lastHeapLog = 0;
+  if (millis() - lastHeapLog > 10000) {
+    lastHeapLog = millis();
+    logMsg("Free heap: " + String(ESP.getFreeHeap()));
+  }
   ArduinoOTA.handle();
   if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
