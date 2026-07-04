@@ -62,6 +62,7 @@ struct SizeEntry {
   uint8_t     charH;
   const uint8_t* unicodeFallback;  // per-size Unicode font (Katakana, CJK, etc.)
   uint8_t     fallbackH;           // raw height of the Unicode fallback font
+  const uint8_t* brailleFallback;
 };
 
 // ========== STRUCTS ==========
@@ -88,15 +89,15 @@ struct TwitchConfig {
 // All fonts render at charH * PRINT_SCALE on the actual paper.
 const SizeEntry SIZE_TABLE[] = {
   { FSIZE_SMALL,  "Small",   u8g2_font_6x10_tf,       u8g2_font_7x13B_tf,
-    10, u8g2_font_unifont_t_japanese1, 16 },
+    10, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
   { FSIZE_MEDIUM, "Medium",  u8g2_font_8x13_tf,        u8g2_font_8x13B_tf,
-    13, u8g2_font_unifont_t_japanese1, 16 },
+    13, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
   { FSIZE_LARGE,  "Large",   u8g2_font_9x15_tf,        u8g2_font_9x15B_tf,
-    15, u8g2_font_unifont_t_japanese1, 16 },
+    15, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
   { FSIZE_XLARGE, "X-Large", u8g2_font_10x20_tf,       u8g2_font_10x20_tf,
-    20, u8g2_font_unifont_t_japanese2, 16 },
+    20, u8g2_font_unifont_t_japanese2, 16, u8g2_font_unifont_t_75 },
   { FSIZE_HUGE,   "Huge",    u8g2_font_logisoso28_tf,  u8g2_font_logisoso28_tf,
-    28, u8g2_font_unifont_t_japanese2, 16 },
+    28, u8g2_font_unifont_t_japanese2, 16, u8g2_font_unifont_t_75 },
 };
 const int SIZE_TABLE_LEN = sizeof(SIZE_TABLE) / sizeof(SIZE_TABLE[0]);
 
@@ -109,6 +110,12 @@ const SizeEntry* getSizeEntry(uint8_t id) {
   for (int i = 0; i < SIZE_TABLE_LEN; i++)
     if (SIZE_TABLE[i].id == id) return &SIZE_TABLE[i];
   return &SIZE_TABLE[1]; // default Medium
+}
+
+const uint8_t* pickFont(uint32_t cp, const uint8_t* primaryFont, const SizeEntry* se) {
+  if (isLatinCodepoint(cp))  return primaryFont;
+  if (isBrailleOrBlock(cp))  return se ? se->brailleFallback : u8g2_font_unifont_t_75;
+  return se ? se->unicodeFallback : UNICODE_FALLBACK_FONT;
 }
 
 void initDefaults() {
@@ -226,6 +233,12 @@ bool isLatinCodepoint(uint32_t cp) {
   return cp <= 0x024F; // Basic Latin + Latin-1 Supplement + Latin Extended-A/B
 }
 
+bool isBrailleOrBlock(uint32_t cp) {
+  return (cp >= 0x2500 && cp <= 0x257F) ||  // Box Drawing
+         (cp >= 0x2580 && cp <= 0x259F) ||  // Block Elements
+         (cp >= 0x2800 && cp <= 0x28FF);    // Braille Patterns
+}
+
 // Word-wrap using the wider of the two fonts for accurate measurement on mixed text
 String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont, const SizeEntry* se = nullptr) {
   U8G2_FOR_ADAFRUIT_GFX u8m;
@@ -237,17 +250,15 @@ String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont, co
     int total = 0, i = 0, len = line.length();
     while (i < len) {
       int segStart = i;
-      int startPos = i;
       uint32_t cp = nextCodepoint(line, i);
-      bool useFallback = !isLatinCodepoint(cp);
-      // Collect run of same font type
+      const uint8_t* useFont = pickFont(cp, primaryFont, se);
       while (i < len) {
         int before = i;
         uint32_t cp2 = nextCodepoint(line, i);
-        if (!isLatinCodepoint(cp2) != useFallback) { i = before; break; }
+        if (pickFont(cp2, primaryFont, se) != useFont) { i = before; break; }
       }
       String seg = line.substring(segStart, i);
-      u8m.setFont(useFallback ? (se ? se->unicodeFallback : UNICODE_FALLBACK_FONT) : primaryFont);
+      u8m.setFont(useFont);
       total += u8m.getUTF8Width(seg.c_str());
     }
     return total;
@@ -330,25 +341,21 @@ int drawLineMixed(U8G2_FOR_ADAFRUIT_GFX& u8g2, const String& line,
                   const SizeEntry* se = nullptr) {
   int curX = x;
   int i = 0, len = line.length();
-  const uint8_t* fallbackFont = se ? se->unicodeFallback : UNICODE_FALLBACK_FONT;
   while (i < len) {
     int segStart = i;
     uint32_t cp = nextCodepoint(line, i);
-    bool useFallback = !isLatinCodepoint(cp);
-    int segEnd = i;
+    const uint8_t* useFont = pickFont(cp, primaryFont, se);
     while (i < len) {
       int before = i;
       uint32_t cp2 = nextCodepoint(line, i);
-      if (!isLatinCodepoint(cp2) != useFallback) { i = before; break; }
-      segEnd = i;
+      if (pickFont(cp2, primaryFont, se) != useFont) { i = before; break; }
     }
-    String seg = line.substring(segStart, segEnd > segStart ? segEnd : i);
-    const uint8_t* useFont = useFallback ? (se ? se->unicodeFallback : UNICODE_FALLBACK_FONT) : primaryFont;
+    String seg = line.substring(segStart, i);
     u8g2.setFont(useFont);
     u8g2.setForegroundColor(fgColor);
     u8g2.setCursor(curX, y);
     u8g2.print(seg);
-    if (bold && !useFallback) { // bold = double-print shifted 1px (Latin only)
+    if (bold && useFont == primaryFont) {
       u8g2.setCursor(curX + 1, y);
       u8g2.print(seg);
     }
@@ -418,15 +425,13 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
         while (mi < mlen) {
           int ms = mi;
           uint32_t cp = nextCodepoint(line, mi);
-          bool fb = !isLatinCodepoint(cp);
-          int me = mi;
+          const uint8_t* curFont = pickFont(cp, primaryFont, se);
           while (mi < mlen) {
             int mb = mi; uint32_t cp2 = nextCodepoint(line, mi);
-            if (!isLatinCodepoint(cp2) != fb) { mi = mb; break; }
-            me = mi;
+            if (pickFont(cp2, primaryFont, se) != curFont) { mi = mb; break; }
           }
-          String seg = line.substring(ms, me > ms ? me : mi);
-          u8m.setFont(fb ? se->unicodeFallback : primaryFont);
+          String seg = line.substring(ms, mi);
+          u8m.setFont(curFont);
           tw += u8m.getUTF8Width(seg.c_str());
         }
 

@@ -1,57 +1,127 @@
 <img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" style="height:64px;margin-right:32px"/>
 
-# still cuts off. I printed this: "Hello! Café resumé naïve Привет ツ"
+# describe the exact changes we need to make to the code
 
-in medium font, centered. the beginning of it starts about 5 or 6 mm from the left. and then it cuts off the 'e' in naive about 3mm from the left. the word after naive doesn't get printed. describe all changes for me to make in code, be very concise
+Here are the exact changes needed. Only 3 areas to touch in [c3Printer.ino](https://github.com/DaverDavids/c3Printer/blob/main/c3Printer.ino):
 
-The problem is the **size normalization** — the font heights differ but their widths weren't normalized. Let me look at exactly what's happening.
+## 1. Add a codepoint range detector (new function)
 
-With `PRINT_SCALE 2`, `renderW = 200px`. Medium font (`8x13`) is 8px wide per char. The unicode fallback (`unifont_t_japanese1`) is 16px wide per char — **twice as wide** as the Latin font.
-
-When `wordWrap` measures the line, it correctly accounts for the mixed fonts. But the issue is the **size normalization introduced for the fallback font**: the fallback renders at its native 16px width in the canvas, but the Latin font only renders at 8px — so the fallback glyphs are **2× wider relative to Latin** in the pre-scale canvas. After PRINT_SCALE×2 upscale, the fallback chars are effectively **4× the printer width** of Latin chars.
-
-Here's the specific issue: the wrapping correctly measures `tw`, but when the line is drawn, the fallback-font segment (ツ) takes 16px in the canvas, which after 2× scale = 32 printer pixels — that's fine. But `Привет` uses the fallback too, and those 6 chars × 16px = 96px in canvas → 192px on paper. Combined with the Latin part, `tw` from `measureLine` matches the draw width, so wrapping is correct.
-
-**The real bug:** `maxTextWidth = renderW - 4 = 196`, but `renderW = 200`. When center-aligned: `x = max(2, (200 - tw) / 2)`. If `tw = 196`, `x = 2`. Drawing goes from 2 to 198 — fine. But if `tw` slightly *exceeds* `renderW - 4` due to measurement rounding (U8g2 `getUTF8Width` can round differently than actual draw), the line is not wrapped and overflows right, AND center-align pushes `x` below 2, so left side clips too.
-
-## Changes to make
-
-**1. Add a safety margin to `maxTextWidth` — change in `printToThermal`:**
+Add this right after `isLatinCodepoint()`:
 
 ```cpp
-// was:
-int maxTextWidth  = renderW - 4;  // 2px margin each side matches drawing margins
-
-// change to:
-int maxTextWidth  = renderW - 8;  // 4px margin each side; guards against measurement rounding
+bool isBrailleOrBlock(uint32_t cp) {
+  return (cp >= 0x2500 && cp <= 0x257F) ||  // Box Drawing
+         (cp >= 0x2580 && cp <= 0x259F) ||  // Block Elements
+         (cp >= 0x2800 && cp <= 0x28FF);    // Braille Patterns
+}
 ```
 
-**2. Clamp `tw` in the alignment block so a line that slipped through wrapping can't overflow — add one line before the `x` calculation:**
+
+## 2. Add braille fallback font to `SizeEntry` and `SIZE_TABLE`
+
+In the `SizeEntry` struct, add one field:
 
 ```cpp
-        tw = min(tw, renderW - 4);  // clamp: never let a line exceed drawable width
-
-        int x = 2;
-        if     (align == 1) x = max(2, (renderW - tw) / 2);
-        else if(align == 2) x = max(2, renderW - tw - 2);
+struct SizeEntry {
+  // ... existing fields ...
+  const uint8_t* brailleFallback;  // ADD THIS
+};
 ```
 
-That `tw = min(tw, renderW - 4)` ensures center/right alignment math can never produce a negative `x`, and left-align at `x=2` won't draw past `renderW - 2` for any line that fit within the clamp.
-
-**3. In `wordWrap`, the `measureLine` lambda has a bug where single-char segments don't accumulate the full run correctly** — the `segEnd` stays at `i` (after first char) when there's only one char before a font switch. This causes under-measurement. Fix the segment collection:
+Then update every row in `SIZE_TABLE` to include `u8g2_font_unifont_t_75` as the last value:
 
 ```cpp
-// In the measureLine lambda, replace the inner while loop and seg assignment:
-      seg = line.substring(segStart, i);  // start with first char already consumed
-      while (i < len) {
-        int before = i;
-        uint32_t cp2 = nextCodepoint(line, i);
-        if (!isLatinCodepoint(cp2) != useFallback) { i = before; break; }
-      }
-      seg = line.substring(segStart, i);  // now seg covers full run including first char
-      u8m.setFont(useFallback ? (se ? se->unicodeFallback : UNICODE_FALLBACK_FONT) : primaryFont);
-      total += u8m.getUTF8Width(seg.c_str());
+const SizeEntry SIZE_TABLE[] = {
+  { FSIZE_SMALL,  "Small",   u8g2_font_6x10_tf,      u8g2_font_7x13B_tf,
+    10, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
+  { FSIZE_MEDIUM, "Medium",  u8g2_font_8x13_tf,       u8g2_font_8x13B_tf,
+    13, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
+  { FSIZE_LARGE,  "Large",   u8g2_font_9x15_tf,       u8g2_font_9x15B_tf,
+    15, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
+  { FSIZE_XLARGE, "X-Large", u8g2_font_10x20_tf,      u8g2_font_10x20_tf,
+    20, u8g2_font_unifont_t_japanese2, 16, u8g2_font_unifont_t_75 },
+  { FSIZE_HUGE,   "Huge",    u8g2_font_logisoso28_tf, u8g2_font_logisoso28_tf,
+    28, u8g2_font_unifont_t_japanese2, 16, u8g2_font_unifont_t_75 },
+};
 ```
 
-The `segEnd` variable and the ternary `segEnd > segStart ? segEnd : i` are the culprit — they exist to handle the single-char case but introduce a subtle off-by-one. Removing them and just using `i` directly after the inner loop is cleaner and correct.
+
+## 3. Add a font-picker helper (new function)
+
+Add this after `getSizeEntry()` — it replaces the scattered inline ternaries for font selection:
+
+```cpp
+const uint8_t* pickFont(uint32_t cp, const uint8_t* primaryFont, const SizeEntry* se) {
+  if (isLatinCodepoint(cp))  return primaryFont;
+  if (isBrailleOrBlock(cp))  return se ? se->brailleFallback : u8g2_font_unifont_t_75;
+  return se ? se->unicodeFallback : UNICODE_FALLBACK_FONT;
+}
+```
+
+
+## 4. Update `drawLineMixed` to use `pickFont`
+
+Replace the font-selection logic inside the `while (i < len)` loop. The current code only checks `isLatinCodepoint` — change it to use `pickFont` so runs are grouped by **which font they use**:
+
+```cpp
+int drawLineMixed(U8G2_FOR_ADAFRUIT_GFX& u8g2, const String& line,
+                  int x, int y, int fgColor,
+                  const uint8_t* primaryFont, bool bold,
+                  const SizeEntry* se = nullptr) {
+  int curX = x;
+  int i = 0, len = line.length();
+  while (i < len) {
+    int segStart = i;
+    uint32_t cp = nextCodepoint(line, i);
+    const uint8_t* useFont = pickFont(cp, primaryFont, se);
+    // collect run of chars using the same font
+    while (i < len) {
+      int before = i;
+      uint32_t cp2 = nextCodepoint(line, i);
+      if (pickFont(cp2, primaryFont, se) != useFont) { i = before; break; }
+    }
+    String seg = line.substring(segStart, i);
+    u8g2.setFont(useFont);
+    u8g2.setForegroundColor(fgColor);
+    u8g2.setCursor(curX, y);
+    u8g2.print(seg);
+    if (bold && useFont == primaryFont) {
+      u8g2.setCursor(curX + 1, y);
+      u8g2.print(seg);
+    }
+    curX += u8g2.getUTF8Width(seg.c_str());
+  }
+  return curX - x;
+}
+```
+
+
+## 5. Update `wordWrap`'s `measureLine` lambda the same way
+
+Replace the inner lambda's font-selection ternary with `pickFont`:
+
+```cpp
+auto measureLine = [&](const String& line) -> int {
+  int total = 0, i = 0, len = line.length();
+  while (i < len) {
+    int segStart = i;
+    uint32_t cp = nextCodepoint(line, i);
+    const uint8_t* useFont = pickFont(cp, primaryFont, se);
+    while (i < len) {
+      int before = i;
+      uint32_t cp2 = nextCodepoint(line, i);
+      if (pickFont(cp2, primaryFont, se) != useFont) { i = before; break; }
+    }
+    String seg = line.substring(segStart, i);
+    u8m.setFont(useFont);
+    total += u8m.getUTF8Width(seg.c_str());
+  }
+  return total;
+};
+```
+
+
+***
+
+That's all of it. The `pickFont` helper is the key unification — it means both rendering and measurement use identical font-routing logic, so word wrap measurements stay accurate for Braille art too. Want me to commit these changes directly to the repo?
 
