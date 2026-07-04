@@ -11,6 +11,11 @@
 #include <SPIFFS.h>
 #include <Secrets.h>
 
+struct VlwFont;
+struct VlwGlyph;
+class PrintCanvas;
+struct EventConfig;
+
 const char* hostname = "c3printer";
 #define TWITCH_CHANNEL "daverdavid"
 
@@ -35,6 +40,21 @@ File uploadFile;
 size_t uploadExpectedSize = 0;
 size_t uploadWrittenBytes = 0;
 bool uploadFailed = false;
+
+#define LOG_BUF_SIZE 4096
+char logBuffer[LOG_BUF_SIZE];
+size_t logHead = 0;
+bool logWrapped = false;
+
+void logMsg(const String& msg) {
+  String line = "[" + String(millis()) + "] " + msg + "\n";
+  for (size_t i = 0; i < line.length(); i++) {
+    logBuffer[logHead] = line[i];
+    logHead = (logHead + 1) % LOG_BUF_SIZE;
+    if (logHead == 0) logWrapped = true;
+  }
+  Serial.print(line);
+}
 
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
@@ -148,7 +168,7 @@ void initDefaults() {
 
 bool loadVlw(VlwFont& f, const char* path) {
   File file = SPIFFS.open(path, "r");
-  if (!file) { Serial.printf("VLW missing: %s\n", path); return false; }
+  if (!file) { logMsg("VLW missing: " + String(path)); return false; }
 
   auto read32 = [&]() -> int32_t {
     uint8_t b[4]; file.read(b, 4);
@@ -186,7 +206,7 @@ bool loadVlw(VlwFont& f, const char* path) {
   }
 
   f.loaded = true;
-  Serial.printf("VLW loaded: %s (%d glyphs)\n", path, f.count);
+  logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs)");
   return true;
 }
 
@@ -401,7 +421,7 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
     if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += lineSpacing * 2;
 
     PrintCanvas canvas(renderW, chunkHeight);
-    if(!canvas.buffer) { Serial.println("Chunk alloc failed!"); return false; }
+    if(!canvas.buffer) { logMsg("Chunk alloc failed!"); return false; }
 
     if(invert) canvas.fillRect(0, 0, renderW, chunkHeight, 1);
 
@@ -473,7 +493,7 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
 
 void printEvent(EventConfig& cfg, String username, String val1, String val2) {
   if(!cfg.enabled) return;
-  Serial.println("Printing Event...");
+  logMsg("Printing Event...");
   for(int i = 0; i < 3; i++) {
     if(cfg.msg[i].length() == 0) continue;
     String p = cfg.msg[i];
@@ -528,7 +548,7 @@ void parseTwitchMessage(String msg) {
 }
 
 void connectTwitch() {
-  Serial.println("Connecting to Twitch IRC...");
+  logMsg("Connecting to Twitch IRC...");
   twitchClient.setInsecure();
   if(twitchClient.connect("irc.chat.twitch.tv", 6697)) {
     twitchClient.println("PASS " TWITCH_OAUTH_SECRET);
@@ -537,10 +557,10 @@ void connectTwitch() {
     twitchClient.println("JOIN #" TWITCH_CHANNEL);
     twitchConnected = true;
     lastTwitchPing  = millis();
-    Serial.println("Twitch OK");
+    logMsg("Twitch OK");
   } else {
     twitchConnected = false;
-    Serial.println("Twitch failed");
+    logMsg("Twitch failed");
   }
 }
 
@@ -562,19 +582,19 @@ void handleTwitchIRC() {
   }
   if(!twitchClient.connected()) {
     twitchConnected = false;
-    Serial.println("Twitch connection lost");
+    logMsg("Twitch connection lost");
   }
 }
 
 // ========== BLE CONNECTION ==========
 
 class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* p)    { Serial.println("BLE Connected"); }
-  void onDisconnect(BLEClient* p) { printerConnected = false; Serial.println("BLE Disconnected"); }
+  void onConnect(BLEClient* p)    { logMsg("BLE Connected"); }
+  void onDisconnect(BLEClient* p) { printerConnected = false; logMsg("BLE Disconnected"); }
 };
 
 bool connectPrinter() {
-  Serial.println("Connecting: " + printerMAC);
+  logMsg("Connecting: " + printerMAC);
   BLEDevice::init("ESP32-C3-Printer");
   if(pClient) delete pClient;
   pClient = BLEDevice::createClient();
@@ -590,7 +610,7 @@ bool connectPrinter() {
   pWriteCharacteristic->writeValue(wake, 5); delay(100);
   uint8_t init[] = {0x1B, 0x40};
   pWriteCharacteristic->writeValue(init, 2); delay(100);
-  Serial.println("Printer Ready");
+  logMsg("Printer Ready");
   return true;
 }
 
@@ -622,7 +642,7 @@ void loadConfig() {
   loadEvent("raid", twitchCfg.raids);
   pointsRewardFilter = preferences.getString("pts_filter", "");
   preferences.end();
-  Serial.println("Config loaded");
+  logMsg("Config loaded");
 }
 
 void saveConfig() {
@@ -647,7 +667,7 @@ void saveConfig() {
   saveEvent("raid", twitchCfg.raids);
   preferences.putString("pts_filter", pointsRewardFilter);
   preferences.end();
-  Serial.println("Config saved");
+  logMsg("Config saved");
 }
 
 // ========== WEB SERVER ==========
@@ -754,10 +774,10 @@ void handleUpload() {
 
   if (upload.status == UPLOAD_FILE_START) {
     String filename = "/" + upload.filename;
-    Serial.printf("Upload start: %s\n", filename.c_str());
+    logMsg("Upload start: " + filename);
 
     size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
-    Serial.printf("SPIFFS free: %u bytes\n", freeBytes);
+    logMsg("SPIFFS free: " + String(freeBytes) + " bytes");
 
     if (SPIFFS.exists(filename)) SPIFFS.remove(filename);
     uploadFile = SPIFFS.open(filename, "w");
@@ -765,7 +785,7 @@ void handleUpload() {
     uploadFailed = false;
 
     if (!uploadFile) {
-      Serial.println("Failed to open file for writing");
+      logMsg("Failed to open file for writing");
       uploadFailed = true;
     }
   }
@@ -774,8 +794,7 @@ void handleUpload() {
       size_t written = uploadFile.write(upload.buf, upload.currentSize);
       uploadWrittenBytes += written;
       if (written != upload.currentSize) {
-        Serial.printf("WRITE MISMATCH: expected %u, wrote %u\n",
-                      upload.currentSize, written);
+        logMsg("WRITE MISMATCH: expected " + String(upload.currentSize) + ", wrote " + String(written));
         uploadFailed = true;
       }
     }
@@ -783,15 +802,14 @@ void handleUpload() {
   }
   else if (upload.status == UPLOAD_FILE_END) {
     if (uploadFile) uploadFile.close();
-    Serial.printf("Upload end. Total written: %u / expected %u\n",
-                  uploadWrittenBytes, upload.totalSize);
+    logMsg("Upload end. Total written: " + String(uploadWrittenBytes) + " / expected " + String(upload.totalSize));
     if (uploadWrittenBytes != upload.totalSize) {
       uploadFailed = true;
-      Serial.println("SIZE MISMATCH — upload incomplete!");
+      logMsg("SIZE MISMATCH — upload incomplete!");
     }
   }
   else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Serial.println("Upload ABORTED by client");
+    logMsg("Upload ABORTED by client");
     uploadFailed = true;
     if (uploadFile) uploadFile.close();
   }
@@ -810,9 +828,9 @@ void handleUploadComplete() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\nESP32-C3 Thermal Printer (VLW SPIFFS Fonts)");
+  logMsg("\n\nESP32-C3 Thermal Printer (VLW SPIFFS Fonts)");
   if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
+    logMsg("SPIFFS mount failed");
   }
   loadConfig();
   loadVlw(fontBasic, "/unifont_basic.vlw");
@@ -822,8 +840,8 @@ void setup() {
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(MYSSID, MYPSK);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
-  if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); Serial.println("mDNS: http://c3printer.local"); }
+  logMsg("\nWiFi OK: " + WiFi.localIP().toString());
+  if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS: http://c3printer.local"); }
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
   connectTwitch();
@@ -860,8 +878,35 @@ void setup() {
     SPIFFS.remove(name);
     server.send(200, "text/html", "<p>Deleted: " + name + "</p><p><a href=\"/spiffs_check\" style=\"color:#a78bfa\">&larr; Back</a></p>");
   });
+  server.on("/console", []() {
+    String out;
+    if (logWrapped) {
+      out += String(logBuffer).substring(logHead);
+      out += String(logBuffer).substring(0, logHead);
+    } else {
+      out = String(logBuffer).substring(0, logHead);
+    }
+    server.send(200, "text/plain", out);
+  });
+  server.on("/log", []() {
+    server.send(200, "text/html", R"rawliteral(
+<!DOCTYPE html><html><head><title>Console</title>
+<style>body{background:#0f0f23;color:#4ade80;font-family:monospace;font-size:12px;padding:10px;white-space:pre-wrap}</style>
+</head><body>
+<div id="log">Loading...</div>
+<script>
+async function tick(){
+  const r = await fetch('/console');
+  document.getElementById('log').textContent = await r.text();
+  window.scrollTo(0, document.body.scrollHeight);
+}
+setInterval(tick, 1000);
+tick();
+</script></body></html>
+)rawliteral");
+  });
   server.begin();
-  Serial.println("Ready!");
+  logMsg("Ready!");
 }
 
 void loop() {
