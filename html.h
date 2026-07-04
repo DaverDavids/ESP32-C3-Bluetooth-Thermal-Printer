@@ -85,6 +85,13 @@ textarea{height:56px;resize:vertical;font-family:monospace}
   </div>
 </div>
 
+<div class="card">
+  <h2>Firmware Update</h2>
+  <input type="file" id="fwFile" accept=".bin">
+  <button class="save" onclick="uploadFirmware()">Flash Firmware</button>
+  <div id="fwStatus" style="font-size:11px;margin-top:6px;color:#9ca3af"></div>
+</div>
+
 <script>
 // Size values are PRINT_SCALE multipliers: 1=Small(16px), 2=Medium(32px), 3=Large(48px)
 const SIZES = [
@@ -217,6 +224,20 @@ async function uploadFonts() {
     } catch (e) {
       status.innerHTML += `${file.name}: FAILED — ${e}<br>`;
     }
+  }
+}
+
+async function uploadFirmware() {
+  const file = document.getElementById('fwFile').files[0];
+  const status = document.getElementById('fwStatus');
+  if (!file) { status.textContent = 'Select a .bin file first'; return; }
+  status.textContent = `Uploading ${file.name} (${file.size} bytes)...`;
+  try {
+    const res = await fetch('/ota_upload', { method: 'POST', body: file });
+    const text = await res.text();
+    status.textContent = res.ok ? 'Update OK — rebooting...' : ('Failed: ' + text);
+  } catch (e) {
+    status.textContent = 'Upload error: ' + e;
   }
 }
 

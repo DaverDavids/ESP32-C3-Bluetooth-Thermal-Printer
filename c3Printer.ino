@@ -3,7 +3,7 @@
 #include <ESPmDNS.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
-#include <ArduinoOTA.h>
+#include <Update.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEClient.h>
@@ -402,6 +402,7 @@ void feedPaper(int lines) {
 bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool invert, int feedLines) {
   if(!printerConnected) return false;
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
+  unsigned long tStart = millis();
 
   text = processNewlines(text);
 
@@ -499,6 +500,8 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   }
 
   if(feedLines > 0) feedPaper(feedLines);
+  unsigned long dt = millis() - tStart;
+  if (dt > 1000) logMsg("printToThermal took " + String(dt) + " ms (" + String(text.length()) + " chars)");
   return true;
 }
 
@@ -610,11 +613,11 @@ bool connectPrinter() {
   if(pClient) delete pClient;
   pClient = BLEDevice::createClient();
   pClient->setClientCallbacks(new MyClientCallback());
-  if(!pClient->connect(BLEAddress(printerMAC.c_str()))) return false;
+  if(!pClient->connect(BLEAddress(printerMAC.c_str()))) { logMsg("BLE connect failed"); return false; }
   BLERemoteService* svc = pClient->getService(serviceUUID);
-  if(!svc) return false;
+  if(!svc) { logMsg("BLE service not found"); pClient->disconnect(); return false; }
   pWriteCharacteristic = svc->getCharacteristic(charWriteUUID);
-  if(!pWriteCharacteristic) return false;
+  if(!pWriteCharacteristic) { logMsg("BLE char not found"); pClient->disconnect(); return false; }
   printerConnected = true;
   delay(500);
   uint8_t wake[] = {0x00,0x00,0x00,0x00,0x00};
@@ -776,6 +779,65 @@ void handleTestEvent() {
   server.send(200,"text/plain","Test Sent");
 }
 
+// ========== FIRMWARE UPDATE ==========
+
+void handleFirmwareUploadStream() {
+  WiFiClient client = server.client();
+
+  String line;
+  size_t contentLength = 0;
+  while (client.connected()) {
+    line = client.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("Content-Length:")) {
+      contentLength = line.substring(16).toInt();
+    }
+    if (line.length() == 0) break;
+  }
+
+  logMsg("Firmware upload start, expecting " + String(contentLength) + " bytes, free heap " + String(ESP.getFreeHeap()));
+
+  if (contentLength == 0) {
+    client.println("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+    logMsg("Firmware upload ERROR: no Content-Length");
+    return;
+  }
+
+  if (!Update.begin(contentLength, U_FLASH)) {
+    logMsg("Update.begin failed: " + String(Update.errorString()));
+    client.println("HTTP/1.1 500 Fail\r\nContent-Length: 0\r\n\r\n");
+    return;
+  }
+
+  size_t written = 0;
+  uint8_t buf[512];
+  while (written < contentLength && client.connected()) {
+    size_t avail = client.available();
+    if (avail) {
+      size_t toRead = min(avail, sizeof(buf));
+      size_t got = client.read(buf, toRead);
+      Update.write(buf, got);
+      written += got;
+    }
+    yield();
+  }
+
+  bool ok = (written == contentLength) && Update.end(true);
+  logMsg(ok ? "Firmware update SUCCESS, rebooting"
+            : ("Firmware update FAILED: " + String(Update.errorString()) + " written " + String(written) + "/" + String(contentLength)));
+
+  if (ok) {
+    client.print("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+    client.stop();
+    delay(300);
+    ESP.restart();
+  } else {
+    Update.abort();
+    client.print("HTTP/1.1 500 Fail\r\nContent-Length: 0\r\n\r\n");
+    client.stop();
+  }
+}
+
 // ========== FILE UPLOAD ==========
 
 void handleUpload() {
@@ -864,8 +926,6 @@ void setup() {
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   logMsg("\nWiFi OK: " + WiFi.localIP().toString());
   if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS: http://c3printer.local"); }
-  ArduinoOTA.setHostname(hostname);
-  ArduinoOTA.begin();
   connectTwitch();
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
@@ -877,6 +937,7 @@ void setup() {
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
+  server.on("/ota_upload", HTTP_POST, [](){}, handleFirmwareUploadStream);
   server.on("/fsinfo", []() {
     size_t total = LittleFS.totalBytes();
     size_t used  = LittleFS.usedBytes();
@@ -917,6 +978,10 @@ void setup() {
     }
     server.send(200, "text/plain", out);
   });
+  server.on("/ping", []() {
+    server.send(200, "text/plain", "pong");
+  });
+
   server.on("/log", []() {
     server.send(200, "text/html", R"rawliteral(
 <!DOCTYPE html><html><head><title>Console</title>
@@ -939,19 +1004,34 @@ tick();
 }
 
 void loop() {
-  static unsigned long lastHeapLog = 0;
-  if (millis() - lastHeapLog > 10000) {
-    lastHeapLog = millis();
-    logMsg("Free heap: " + String(ESP.getFreeHeap()));
+  static unsigned long lastHeapLog = 0, lastWiFiLog = 0;
+  unsigned long now = millis();
+
+  if (now - lastHeapLog > 10000) {
+    lastHeapLog = now;
+    int rssi = WiFi.RSSI();
+    logMsg("Uptime " + String(now / 1000) + "s  Free heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()) + "  RSSI " + String(rssi) + "dBm");
   }
-  ArduinoOTA.handle();
+
+  wl_status_t wifiStatus = WiFi.status();
+  static wl_status_t lastWifiStatus = WL_CONNECTED;
+  if (wifiStatus != lastWifiStatus) {
+    lastWifiStatus = wifiStatus;
+    logMsg("WiFi status changed: " + String(wifiStatus));
+    if (wifiStatus == WL_CONNECTED) logMsg("WiFi reconnected: " + WiFi.localIP().toString());
+  }
+
   if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
   static unsigned long lastTwitchRetry = 0, lastPrinterRetry = 0;
-  unsigned long now = millis();
   if (!uploadInProgress) {
-    if(twitchConnected)   handleTwitchIRC();
-    else if(now - lastTwitchRetry  > 10000) { lastTwitchRetry  = now; connectTwitch();   }
+    if(twitchConnected) {
+      unsigned long t0 = micros();
+      handleTwitchIRC();
+      unsigned long dt = micros() - t0;
+      if (dt > 50000) logMsg("WARN: handleTwitchIRC took " + String(dt) + " us");
+    }
+    else if(now - lastTwitchRetry > 10000) { lastTwitchRetry = now; connectTwitch(); }
     if(!printerConnected && now - lastPrinterRetry > 15000) { lastPrinterRetry = now; connectPrinter(); }
   }
   delay(10);
