@@ -848,10 +848,11 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   logMsg("\n\nESP32-C3 Thermal Printer (VLW LittleFS Fonts)");
-  if (!LittleFS.begin(false)) {
-    logMsg("LittleFS mount failed");
-  }
-  logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
+  if (!LittleFS.begin(true)) {   // true = format if mount fails
+    logMsg("LittleFS mount failed even after format attempt");
+  } else {
+    logMsg("LittleFS mounted OK");
+  }  logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
   loadConfig();
   // NOTE: custom partition table must provide ~1.5MB+ LittleFS partition.
   loadVlw(fontBasic, "/unifont_basic.vlw");
