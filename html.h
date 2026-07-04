@@ -88,7 +88,8 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 <div class="card">
   <h2>Firmware Update</h2>
   <input type="file" id="fwFile" accept=".bin">
-  <button class="save" onclick="uploadFirmware()">Flash Firmware</button>
+  <button class="save" onclick="enterUpdateMode()" style="background:#b91c1c">Enter Update Mode</button>
+  <button class="save" onclick="uploadFirmware()" style="margin-top:4px">Flash Firmware</button>
   <div id="fwStatus" style="font-size:11px;margin-top:6px;color:#9ca3af"></div>
 </div>
 
@@ -225,6 +226,12 @@ async function uploadFonts() {
       status.innerHTML += `${file.name}: FAILED — ${e}<br>`;
     }
   }
+}
+
+async function enterUpdateMode() {
+  const status = document.getElementById('fwStatus');
+  status.textContent = 'Rebooting into update mode... wait ~5s then upload';
+  await fetch('/enter_update_mode', { method: 'POST' });
 }
 
 async function uploadFirmware() {

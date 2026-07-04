@@ -9,6 +9,7 @@
 #include <BLEClient.h>
 #include <Adafruit_GFX.h>
 #include <LittleFS.h>
+#include "esp_ota_ops.h"
 #include <Secrets.h>
 #include "html.h"
 
@@ -33,6 +34,9 @@ BLEClient* pClient = nullptr;
 BLERemoteCharacteristic* pWriteCharacteristic = nullptr;
 bool printerConnected = false;
 bool twitchConnected  = false;
+
+enum BLEConnState { BLE_IDLE, BLE_CONNECTING, BLE_DISCOVERING, BLE_INITING, BLE_READY, BLE_FAILED };
+volatile BLEConnState bleState = BLE_IDLE;
 unsigned long lastTwitchPing = 0;
 
 String pointsRewardFilter = "";
@@ -603,34 +607,31 @@ void handleTwitchIRC() {
 // ========== BLE CONNECTION ==========
 
 class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* p)    { logMsg("BLE Connected"); }
-  void onDisconnect(BLEClient* p) { printerConnected = false; logMsg("BLE Disconnected"); }
+  void onConnect(BLEClient* p) {
+    logMsg("BLE Connected");
+    if (bleState == BLE_CONNECTING) bleState = BLE_DISCOVERING;
+  }
+  void onDisconnect(BLEClient* p) {
+    printerConnected = false;
+    bleState = BLE_IDLE;
+    logMsg("BLE Disconnected");
+  }
 };
 
-bool connectPrinter() {
+void connectPrinter() {
   logMsg("Connecting: " + printerMAC);
   BLEDevice::init("ESP32-C3-Printer");
   if(pClient) delete pClient;
   pClient = BLEDevice::createClient();
   pClient->setClientCallbacks(new MyClientCallback());
-  if(!pClient->connect(BLEAddress(printerMAC.c_str()))) { logMsg("BLE connect failed"); return false; }
-  BLERemoteService* svc = pClient->getService(serviceUUID);
-  if(!svc) { logMsg("BLE service not found"); pClient->disconnect(); return false; }
-  pWriteCharacteristic = svc->getCharacteristic(charWriteUUID);
-  if(!pWriteCharacteristic) { logMsg("BLE char not found"); pClient->disconnect(); return false; }
-  printerConnected = true;
-  delay(500);
-  uint8_t wake[] = {0x00,0x00,0x00,0x00,0x00};
-  pWriteCharacteristic->writeValue(wake, 5); delay(100);
-  uint8_t init[] = {0x1B, 0x40};
-  pWriteCharacteristic->writeValue(init, 2); delay(100);
-  logMsg("Printer Ready");
-  return true;
+  bleState = BLE_CONNECTING;
+  pClient->connect(BLEAddress(printerMAC.c_str()), true);
 }
 
 void disconnectPrinter() {
   if(pClient && printerConnected) pClient->disconnect();
   printerConnected = false;
+  bleState = BLE_IDLE;
 }
 
 // ========== CONFIGURATION STORAGE ==========
@@ -717,7 +718,7 @@ void handleGetConfig() {
   server.send(200, "application/json", json);
 }
 
-void handleConnect()    { if(connectPrinter()) server.send(200,"text/plain","Connected!"); else server.send(500,"text/plain","Failed"); }
+void handleConnect()    { connectPrinter(); server.send(200,"text/plain","Connecting..."); }
 void handleDisconnect() { disconnectPrinter(); server.send(200,"text/plain","Disconnected"); }
 
 void handlePrint() {
@@ -886,7 +887,7 @@ void setup() {
     logMsg("LittleFS mounted OK");
   }  logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
   loadConfig();
-  // NOTE: custom partition table must provide ~1.5MB+ LittleFS partition.
+  // NOTE: partitions.csv: factory 256KB + ota_0 1.5MB + spiffs ~2.19MB
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
   WiFi.mode(WIFI_STA);
@@ -907,6 +908,19 @@ void setup() {
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
+  server.on("/enter_update_mode", HTTP_POST, [](){
+    server.send(200, "text/plain", "Rebooting into update mode...");
+    delay(300);
+    const esp_partition_t* factory_part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (factory_part) {
+      esp_ota_set_boot_partition(factory_part);
+      ESP.restart();
+    } else {
+      logMsg("ERROR: factory partition not found");
+    }
+  });
+
   server.on("/ota_upload", HTTP_POST,
     [](){
       server.sendHeader("Connection", "close");
@@ -1010,7 +1024,41 @@ void loop() {
       if (dt > 50000) logMsg("WARN: handleTwitchIRC took " + String(dt) + " us");
     }
     else if(now - lastTwitchRetry > 10000) { lastTwitchRetry = now; connectTwitch(); }
-    if(!printerConnected && now - lastPrinterRetry > 15000) { lastPrinterRetry = now; connectPrinter(); }
+    if (bleState == BLE_IDLE && !printerConnected && now - lastPrinterRetry > 15000) {
+      lastPrinterRetry = now;
+      connectPrinter();
+    }
+    if (bleState == BLE_DISCOVERING) {
+      static unsigned long discoverStart = 0;
+      if (discoverStart == 0) discoverStart = now;
+      BLERemoteService* svc = pClient->getService(serviceUUID);
+      if (svc) {
+        pWriteCharacteristic = svc->getCharacteristic(charWriteUUID);
+        if (pWriteCharacteristic) {
+          discoverStart = 0;
+          bleState = BLE_INITING;
+        } else {
+          logMsg("BLE char not found");
+          pClient->disconnect();
+          discoverStart = 0;
+          bleState = BLE_FAILED;
+        }
+      } else if (now - discoverStart > 10000) {
+        logMsg("BLE discover timeout");
+        pClient->disconnect();
+        discoverStart = 0;
+        bleState = BLE_FAILED;
+      }
+    }
+    if (bleState == BLE_INITING) {
+      printerConnected = true;
+      uint8_t wake[] = {0x00,0x00,0x00,0x00,0x00};
+      pWriteCharacteristic->writeValue(wake, 5);
+      uint8_t init[] = {0x1B, 0x40};
+      pWriteCharacteristic->writeValue(init, 2);
+      logMsg("Printer Ready");
+      bleState = BLE_READY;
+    }
   }
   delay(10);
 }
