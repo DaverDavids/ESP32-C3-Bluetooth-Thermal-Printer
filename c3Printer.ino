@@ -8,7 +8,7 @@
 #include <BLEUtils.h>
 #include <BLEClient.h>
 #include <Adafruit_GFX.h>
-#include <U8g2_for_Adafruit_GFX.h>
+#include <SPIFFS.h>
 #include <Secrets.h>
 
 const char* hostname = "c3printer";
@@ -35,44 +35,136 @@ bool shouldSaveConfig = false;
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
-// ========== FONT SYSTEM ==========
-// User picks a SIZE (0-4) and bold (true/false) separately.
-// Each size has a normal and bold variant for Latin/extended.
-// For any character outside Latin range, we automatically fall back
-// to the Japanese Unifont which covers Katakana, CJK, Greek, Arabic, etc.
-
-// Size IDs
-#define FSIZE_SMALL   0   // ~7px  — tiny labels
-#define FSIZE_MEDIUM  1   // ~13px — standard
-#define FSIZE_LARGE   2   // ~15px — bigger
-#define FSIZE_XLARGE  3   // ~20px — large text
-#define FSIZE_HUGE    4   // ~28px — headlines
-
-// Global print scale multiplier. Each rendered bitmap row/column is repeated this
-// many times before sending to the printer, giving crisp pixel-scaled output.
-// 2 = 2x size (recommended for small thermal printers where even Large feels tiny).
-// Adjust to taste: 1 = native, 3 = very large.
+// ========== PRINT SCALE ==========
+// PRINT_SCALE 1 = 16px on paper (Small)
+// PRINT_SCALE 2 = 32px on paper (Medium, default)
+// PRINT_SCALE 3 = 48px on paper (Large)
 #define PRINT_SCALE 2
 
-struct SizeEntry {
-  uint8_t     id;
-  const char* label;
-  const uint8_t* fontNormal;
-  const uint8_t* fontBold;
-  uint8_t     charH;
-  const uint8_t* unicodeFallback;  // per-size Unicode font (Katakana, CJK, etc.)
-  uint8_t     fallbackH;           // raw height of the Unicode fallback font
-  const uint8_t* brailleFallback;
+// Scale IDs used in EventConfig.font[]
+#define SCALE_SMALL  1
+#define SCALE_MEDIUM 2
+#define SCALE_LARGE  3
+
+// ========== VLW FONT STRUCTS ==========
+
+struct VlwGlyph {
+  uint32_t cp;
+  int16_t  w, h, advance, x_off, y_off;
+  uint32_t bitmapOffset;
 };
+
+struct VlwFont {
+  int      count;
+  int      size;
+  VlwGlyph* glyphs;
+  uint8_t*  bitmaps;
+  size_t    bitmapBytes;
+  bool      loaded;
+};
+
+VlwFont fontBasic = {0};
+VlwFont fontCJK   = {0};
+
+// ========== VLW LOADER ==========
+
+bool loadVlw(VlwFont& f, const char* path) {
+  File file = SPIFFS.open(path, "r");
+  if (!file) { Serial.printf("VLW missing: %s\n", path); return false; }
+
+  auto read32 = [&]() -> int32_t {
+    uint8_t b[4]; file.read(b, 4);
+    return (b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+  };
+
+  f.count  = read32();
+  int ver  = read32();
+  f.size   = read32();
+  read32(); read32(); read32(); // reserved
+
+  f.glyphs = (VlwGlyph*)malloc(f.count * sizeof(VlwGlyph));
+  if (!f.glyphs) { file.close(); return false; }
+
+  for (int i = 0; i < f.count; i++) {
+    f.glyphs[i].cp      = (uint32_t)read32();
+    f.glyphs[i].h       = (int16_t)read32();
+    f.glyphs[i].w       = (int16_t)read32();
+    f.glyphs[i].advance = (int16_t)read32();
+    f.glyphs[i].x_off   = (int16_t)read32();
+    f.glyphs[i].y_off   = (int16_t)read32();
+  }
+
+  // Read all bitmaps into heap
+  f.bitmapBytes = file.size() - file.position();
+  f.bitmaps = (uint8_t*)malloc(f.bitmapBytes);
+  if (!f.bitmaps) { free(f.glyphs); file.close(); return false; }
+  file.read(f.bitmaps, f.bitmapBytes);
+  file.close();
+
+  // Compute bitmap offsets per glyph
+  size_t offset = 0;
+  for (int i = 0; i < f.count; i++) {
+    f.glyphs[i].bitmapOffset = offset;
+    int rowBytes = (f.glyphs[i].w + 7) / 8;
+    offset += rowBytes * f.glyphs[i].h;
+  }
+
+  f.loaded = true;
+  Serial.printf("VLW loaded: %s (%d glyphs)\n", path, f.count);
+  return true;
+}
+
+// ========== GLYPH LOOKUP ==========
+
+// Binary search — glyphs are stored in codepoint order from make_vlw.py
+const VlwGlyph* findGlyph(const VlwFont& f, uint32_t cp) {
+  if (!f.loaded) return nullptr;
+  int lo = 0, hi = f.count - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    if      (f.glyphs[mid].cp == cp) return &f.glyphs[mid];
+    else if (f.glyphs[mid].cp  < cp) lo = mid + 1;
+    else                              hi = mid - 1;
+  }
+  return nullptr;
+}
+
+// Returns glyph + source font pointer; checks basic first, then CJK
+const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
+  const VlwGlyph* g = findGlyph(fontBasic, cp);
+  if (g) { if (outFont) *outFont = &fontBasic; return g; }
+  g = findGlyph(fontCJK, cp);
+  if (g) { if (outFont) *outFont = &fontCJK;   return g; }
+  if (outFont) *outFont = nullptr;
+  return nullptr;
+}
+
+// Draw one glyph into PrintCanvas at (x, baseline_y). Returns advance width.
+int drawGlyph(PrintCanvas& canvas, const VlwFont& font, const VlwGlyph* g,
+              int x, int baseline_y, bool invert) {
+  if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
+  int rowBytes = (g->w + 7) / 8;
+  const uint8_t* bmp = font.bitmaps + g->bitmapOffset;
+  for (int row = 0; row < g->h; row++) {
+    int py = baseline_y + g->y_off + row;
+    for (int col = 0; col < g->w; col++) {
+      int px = x + g->x_off + col;
+      uint8_t byte = bmp[row * rowBytes + col / 8];
+      bool set = (byte >> (7 - (col % 8))) & 1;
+      if (set) canvas.drawPixel(px, py, invert ? 0 : 1);
+    }
+  }
+  return g->advance;
+}
 
 // ========== STRUCTS ==========
 
 struct EventConfig {
   bool    enabled = true;
   String  msg[3];
-  uint8_t font[3];   // stores FSIZE_* id
+  uint8_t font[3];   // stores SCALE_* value (1=Small, 2=Medium, 3=Large)
   int     align[3];
-  bool    bold[3];
+  bool    bold[3];   // retained in config; bold is cosmetic (not used by VLW path)
   bool    invert[3];
   int     feed = 3;
 };
@@ -84,82 +176,33 @@ struct TwitchConfig {
   EventConfig raids;
 } twitchCfg;
 
-// charH = native height of the primary font (pre-PRINT_SCALE).
-// unicodeFallback is the closest-height Unicode font available in U8g2 for each tier.
-// All fonts render at charH * PRINT_SCALE on the actual paper.
-const SizeEntry SIZE_TABLE[] = {
-  { FSIZE_SMALL,  "Small",   u8g2_font_6x10_tf,       u8g2_font_7x13B_tf,
-    10, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
-  { FSIZE_MEDIUM, "Medium",  u8g2_font_8x13_tf,        u8g2_font_8x13B_tf,
-    13, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
-  { FSIZE_LARGE,  "Large",   u8g2_font_9x15_tf,        u8g2_font_9x15B_tf,
-    15, u8g2_font_unifont_t_japanese1, 16, u8g2_font_unifont_t_75 },
-  { FSIZE_XLARGE, "X-Large", u8g2_font_10x20_tf,       u8g2_font_10x20_tf,
-    20, u8g2_font_unifont_t_japanese2, 16, u8g2_font_unifont_t_75 },
-  { FSIZE_HUGE,   "Huge",    u8g2_font_logisoso28_tf,  u8g2_font_logisoso28_tf,
-    28, u8g2_font_unifont_t_japanese2, 16, u8g2_font_unifont_t_75 },
-};
-const int SIZE_TABLE_LEN = sizeof(SIZE_TABLE) / sizeof(SIZE_TABLE[0]);
-
-// Global fallback kept for contexts without a SizeEntry (e.g. wordWrap default).
-// Per-size fallback fonts are now in SizeEntry.unicodeFallback.
-const uint8_t* UNICODE_FALLBACK_FONT = u8g2_font_unifont_t_japanese1;
-const uint8_t  UNICODE_FALLBACK_H    = 16;
-
-// ========== CODEPOINT CLASSIFIERS ==========
-// These MUST be defined before getSizeEntry() and pickFont().
-
-// Returns true if this codepoint is covered by the standard Latin/extended fonts
-// (i.e., ISO-8859 / basic Latin + extended Latin)
-bool isLatinCodepoint(uint32_t cp) {
-  return cp <= 0x024F; // Basic Latin + Latin-1 Supplement + Latin Extended-A/B
-}
-
-bool isBrailleOrBlock(uint32_t cp) {
-  return (cp >= 0x2500 && cp <= 0x257F) ||  // Box Drawing
-         (cp >= 0x2580 && cp <= 0x259F) ||  // Block Elements
-         (cp >= 0x2800 && cp <= 0x28FF);    // Braille Patterns
-}
-
-const SizeEntry* getSizeEntry(uint8_t id) {
-  for (int i = 0; i < SIZE_TABLE_LEN; i++)
-    if (SIZE_TABLE[i].id == id) return &SIZE_TABLE[i];
-  return &SIZE_TABLE[1]; // default Medium
-}
-
-const uint8_t* pickFont(uint32_t cp, const uint8_t* primaryFont, const SizeEntry* se) {
-  if (isLatinCodepoint(cp))  return primaryFont;
-  if (isBrailleOrBlock(cp))  return se ? se->brailleFallback : u8g2_font_unifont_t_75;
-  return se ? se->unicodeFallback : UNICODE_FALLBACK_FONT;
-}
-
 void initDefaults() {
   twitchCfg.subs.msg[0] = "NEW SUB:";
   twitchCfg.subs.msg[1] = "{user}!";
   twitchCfg.subs.msg[2] = "";
   for(int i=0;i<3;i++){
-    twitchCfg.subs.font[i]=FSIZE_MEDIUM; twitchCfg.subs.align[i]=1;
+    twitchCfg.subs.font[i]=SCALE_MEDIUM; twitchCfg.subs.align[i]=1;
     twitchCfg.subs.bold[i]=true; twitchCfg.subs.invert[i]=false;
   }
   twitchCfg.bits.msg[0] = "CHEER:";
   twitchCfg.bits.msg[1] = "{user}";
   twitchCfg.bits.msg[2] = "{amount} bits";
   for(int i=0;i<3;i++){
-    twitchCfg.bits.font[i]=FSIZE_MEDIUM; twitchCfg.bits.align[i]=1;
+    twitchCfg.bits.font[i]=SCALE_MEDIUM; twitchCfg.bits.align[i]=1;
     twitchCfg.bits.bold[i]=true; twitchCfg.bits.invert[i]=false;
   }
   twitchCfg.points.msg[0] = "REDEEM:";
   twitchCfg.points.msg[1] = "{user}";
   twitchCfg.points.msg[2] = "{reward}";
   for(int i=0;i<3;i++){
-    twitchCfg.points.font[i]=FSIZE_MEDIUM; twitchCfg.points.align[i]=1;
+    twitchCfg.points.font[i]=SCALE_MEDIUM; twitchCfg.points.align[i]=1;
     twitchCfg.points.bold[i]=true; twitchCfg.points.invert[i]=false;
   }
   twitchCfg.raids.msg[0] = "RAID!";
   twitchCfg.raids.msg[1] = "from";
   twitchCfg.raids.msg[2] = "{user}";
   for(int i=0;i<3;i++){
-    twitchCfg.raids.font[i]=FSIZE_HUGE; twitchCfg.raids.align[i]=1;
+    twitchCfg.raids.font[i]=SCALE_LARGE; twitchCfg.raids.align[i]=1;
     twitchCfg.raids.bold[i]=false; twitchCfg.raids.invert[i]=false;
   }
 }
@@ -242,31 +285,22 @@ uint32_t nextCodepoint(const String& s, int& i) {
   { uint32_t cp = (c & 0x07); i++; for(int j=0;j<3&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
 }
 
-// Word-wrap using the wider of the two fonts for accurate measurement on mixed text
-String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont, const SizeEntry* se = nullptr) {
-  U8G2_FOR_ADAFRUIT_GFX u8m;
-  PrintCanvas dummy(8, 8);
-  u8m.begin(dummy);
+// ========== VLW WORD WRAP ==========
 
-  // Measure a line width accounting for font switching per segment
-  auto measureLine = [&](const String& line) -> int {
-    int total = 0, i = 0, len = line.length();
-    while (i < len) {
-      int segStart = i;
-      uint32_t cp = nextCodepoint(line, i);
-      const uint8_t* useFont = pickFont(cp, primaryFont, se);
-      while (i < len) {
-        int before = i;
-        uint32_t cp2 = nextCodepoint(line, i);
-        if (pickFont(cp2, primaryFont, se) != useFont) { i = before; break; }
-      }
-      String seg = line.substring(segStart, i);
-      u8m.setFont(useFont);
-      total += u8m.getUTF8Width(seg.c_str());
-    }
-    return total;
-  };
+// Measure a string's rendered width using VLW glyph advances
+int measureTextVlw(const String& text) {
+  int total = 0, i = 0, len = (int)text.length();
+  while (i < len) {
+    uint32_t cp = nextCodepoint(text, i);
+    const VlwFont* srcFont = nullptr;
+    const VlwGlyph* g = getGlyph(cp, &srcFont);
+    if (g) total += g->advance;
+    else   total += fontBasic.size / 2; // fallback estimate for missing glyphs
+  }
+  return total;
+}
 
+String wordWrap(const String& text, int maxWidth) {
   String result = "";
   int lineStart = 0, textLen = (int)text.length();
 
@@ -275,17 +309,17 @@ String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont, co
     if (lineEnd < 0) lineEnd = textLen;
     String line = text.substring(lineStart, lineEnd);
 
-    if (measureLine(line) <= maxWidth) {
+    if (measureTextVlw(line) <= maxWidth) {
       result += line;
       if (lineEnd < textLen) result += "\n";
     } else {
       while (line.length() > 0) {
-        if (measureLine(line) <= maxWidth) { result += line; break; }
-        int lo = 1, hi = line.length(), breakAt = 1;
+        if (measureTextVlw(line) <= maxWidth) { result += line; break; }
+        int lo = 1, hi = (int)line.length(), breakAt = 1;
         while (lo <= hi) {
           int mid = (lo + hi) / 2;
           String test = line.substring(0, mid);
-          if (measureLine(test) <= maxWidth) { breakAt = mid; lo = mid + 1; }
+          if (measureTextVlw(test) <= maxWidth) { breakAt = mid; lo = mid + 1; }
           else hi = mid - 1;
         }
         int lastSpace = line.lastIndexOf(' ', breakAt);
@@ -334,65 +368,33 @@ void feedPaper(int lines) {
   }
 }
 
-// Draw one text line with automatic font fallback per Unicode segment.
-// Segments of Latin chars use primaryFont; Braille/Block use brailleFallback;
-// all other non-Latin use unicodeFallback.
-// PRINT_SCALE is applied via repeated-row rendering in printToThermal.
-// Returns the width drawn (in canvas pixels, i.e. pre-scale).
-int drawLineMixed(U8G2_FOR_ADAFRUIT_GFX& u8g2, const String& line,
-                  int x, int y, int fgColor,
-                  const uint8_t* primaryFont, bool bold,
-                  const SizeEntry* se = nullptr) {
-  int curX = x;
-  int i = 0, len = line.length();
-  while (i < len) {
-    int segStart = i;
-    uint32_t cp = nextCodepoint(line, i);
-    const uint8_t* useFont = pickFont(cp, primaryFont, se);
-    while (i < len) {
-      int before = i;
-      uint32_t cp2 = nextCodepoint(line, i);
-      if (pickFont(cp2, primaryFont, se) != useFont) { i = before; break; }
-    }
-    String seg = line.substring(segStart, i);
-    u8g2.setFont(useFont);
-    u8g2.setForegroundColor(fgColor);
-    u8g2.setCursor(curX, y);
-    u8g2.print(seg);
-    if (bold && useFont == primaryFont) {
-      u8g2.setCursor(curX + 1, y);
-      u8g2.print(seg);
-    }
-    curX += u8g2.getUTF8Width(seg.c_str());
-  }
-  return curX - x;
-}
+// ========== THERMAL PRINT ==========
 
-bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool invert, int feedLines) {
+bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool invert, int feedLines) {
   if(!printerConnected) return false;
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
 
   text = processNewlines(text);
-  const SizeEntry* se = getSizeEntry(sizeId);
-  const uint8_t* primaryFont = bold ? se->fontBold : se->fontNormal;
 
-  // Render at 1/PRINT_SCALE width, then scale up by repeating pixels/rows.
-  // This gives clean crisp scaling for bitmap fonts (avoids blurry stretching).
-  int renderW       = PRINTER_WIDTH / PRINT_SCALE;
-  int maxTextWidth  = renderW - 8;
-  text = wordWrap(text, maxTextWidth, primaryFont, se);
+  // Clamp scale to valid range
+  if (printScale < 1) printScale = 1;
+  if (printScale > 3) printScale = 3;
+
+  // VLW native size is 16px; render at renderW then scale up
+  const int vlwSize    = (fontBasic.loaded ? fontBasic.size : 16);
+  const int renderW    = PRINTER_WIDTH / printScale;
+  const int maxTextW   = renderW - 8;
+  const int lineSpacing = 3;
+  const int lineHeight  = vlwSize + lineSpacing;
+  const int baseline    = vlwSize; // y offset within a line to the glyph baseline
+
+  text = wordWrap(text, maxTextW);
 
   int totalLines = 1;
   for(int i = 0; i < (int)text.length(); i++) if(text[i] == '\n') totalLines++;
 
-  // Line height uses the taller of primary vs unicode fallback (pre-scale)
-  int charHeight  = max((int)se->charH, (int)se->fallbackH);
-  int lineSpacing = max(2, charHeight / 6);
-  int lineHeight  = charHeight + lineSpacing;
   int linesPerChunk = max(1, 200 / lineHeight);
-
   int currentLineIndex = 0, textIndex = 0;
-  int fgColor = invert ? 0 : 1;
 
   while(currentLineIndex < totalLines) {
     int chunkLineCount = 0, chunkHeight = 0;
@@ -407,64 +409,54 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
 
     if(invert) canvas.fillRect(0, 0, renderW, chunkHeight, 1);
 
-    U8G2_FOR_ADAFRUIT_GFX u8g2;
-    u8g2.begin(canvas);
-    u8g2.setFontMode(1);
-    u8g2.setFontDirection(0);
-    u8g2.setBackgroundColor(invert ? 1 : 0);
-
-    int drawY = (currentLineIndex == 0) ? lineSpacing + charHeight : charHeight;
+    int drawY = (currentLineIndex == 0) ? lineSpacing + baseline : baseline;
 
     for(int i = 0; i < chunkLineCount; i++) {
       int lineEnd = text.indexOf('\n', textIndex);
-      if(lineEnd < 0) lineEnd = text.length();
+      if(lineEnd < 0) lineEnd = (int)text.length();
       String line = text.substring(textIndex, lineEnd);
 
       if(line.length() > 0) {
-        // Measure full line width for alignment (accounting for mixed fonts)
-        U8G2_FOR_ADAFRUIT_GFX u8m;
-        PrintCanvas dm(8, 8);
-        u8m.begin(dm);
-        int tw = 0, mi = 0, mlen = line.length();
-        while (mi < mlen) {
-          int ms = mi;
-          uint32_t cp = nextCodepoint(line, mi);
-          const uint8_t* curFont = pickFont(cp, primaryFont, se);
-          while (mi < mlen) {
-            int mb = mi; uint32_t cp2 = nextCodepoint(line, mi);
-            if (pickFont(cp2, primaryFont, se) != curFont) { mi = mb; break; }
-          }
-          String seg = line.substring(ms, mi);
-          u8m.setFont(curFont);
-          tw += u8m.getUTF8Width(seg.c_str());
-        }
-
-        tw = min(tw, renderW - 4);
+        // Measure line width for alignment
+        int tw = min(measureTextVlw(line), renderW - 4);
 
         int x = 2;
         if     (align == 1) x = max(2, (renderW - tw) / 2);
         else if(align == 2) x = max(2, renderW - tw - 2);
 
-        drawLineMixed(u8g2, line, x, drawY, fgColor, primaryFont, bold, se);
+        // Draw each codepoint
+        int ci = 0, clen = (int)line.length();
+        while (ci < clen) {
+          uint32_t cp = nextCodepoint(line, ci);
+          const VlwFont* srcFont = nullptr;
+          const VlwGlyph* g = getGlyph(cp, &srcFont);
+          if (g && srcFont) {
+            x += drawGlyph(canvas, *srcFont, g, x, drawY, invert);
+          } else {
+            x += vlwSize / 2; // advance past missing glyph
+          }
+          if (x >= renderW - 2) break; // overrun guard
+        }
       }
+
       drawY    += lineHeight;
       textIndex = lineEnd + 1;
     }
 
-    // Scale up: repeat each row and column PRINT_SCALE times for crisp 2x output
+    // Scale up: repeat each row and column printScale times for crisp output
     {
-      int scaledH = chunkHeight * PRINT_SCALE;
+      int scaledH      = chunkHeight * printScale;
       int scaledWBytes = PRINTER_WIDTH / 8;
       int renderWBytes = renderW / 8;
-      uint8_t* scaled = (uint8_t*)malloc(scaledWBytes * scaledH);
+      uint8_t* scaled  = (uint8_t*)malloc(scaledWBytes * scaledH);
       if (scaled) {
         memset(scaled, 0, scaledWBytes * scaledH);
         for (int row = 0; row < chunkHeight; row++) {
           const uint8_t* srcRow = canvas.buffer + row * renderWBytes;
-          for (int rep = 0; rep < PRINT_SCALE; rep++) {
-            uint8_t* dstRow = scaled + (row * PRINT_SCALE + rep) * scaledWBytes;
+          for (int rep = 0; rep < printScale; rep++) {
+            uint8_t* dstRow = scaled + (row * printScale + rep) * scaledWBytes;
             for (int dstBit = 0; dstBit < PRINTER_WIDTH; dstBit++) {
-              int srcBit = dstBit / PRINT_SCALE;
+              int srcBit = dstBit / printScale;
               if (srcBit < renderW) {
                 int sb = srcBit / 8, sbit = 7 - (srcBit % 8);
                 if (srcRow[sb] & (1 << sbit)) {
@@ -743,9 +735,9 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 </div>
 
 <script>
-// Size IDs must match FSIZE_* defines in firmware
+// Size values are PRINT_SCALE multipliers: 1=Small(16px), 2=Medium(32px), 3=Large(48px)
 const SIZES = [
-  [0,"Small"],[1,"Medium"],[2,"Large"],[3,"X-Large"],[4,"Huge"]
+  [1,"Small"],[2,"Medium"],[3,"Large"]
 ];
 
 const evts   = ['sub','bit','pts','raid'];
@@ -771,7 +763,7 @@ function render() {
         <span class="line-num">${l+1}</span>
         <input type="text" id="${k}${l}_m" placeholder="Line ${l+1} ({user} {amount} {reward})">
         <div class="ctl size-ctl">
-          <select id="${k}${l}_s">${sizeOpts(1)}</select>
+          <select id="${k}${l}_s">${sizeOpts(2)}</select>
           <span class="tiny-lbl">Size</span>
         </div>
         <div class="ctl align-ctl">
@@ -793,7 +785,7 @@ function render() {
     h += `</div>`;
   });
   document.getElementById('cfg').innerHTML = h;
-  document.getElementById('t_s').innerHTML = sizeOpts(1);
+  document.getElementById('t_s').innerHTML = sizeOpts(2);
 }
 
 function load() {
@@ -910,11 +902,11 @@ void handleDisconnect() { disconnectPrinter(); server.send(200,"text/plain","Dis
 void handlePrint() {
   if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
   String text = sanitizeText(server.arg("txt"));
-  uint8_t sizeId = server.hasArg("sz") ? (uint8_t)server.arg("sz").toInt() : FSIZE_MEDIUM;
+  uint8_t printScale = server.hasArg("sz") ? (uint8_t)server.arg("sz").toInt() : SCALE_MEDIUM;
   int  al  = server.hasArg("al")  ? server.arg("al").toInt()   : 1;
   bool b   = server.hasArg("b")   ? (server.arg("b")  =="1")   : true;
   bool inv = server.hasArg("inv") ? (server.arg("inv")=="1")   : false;
-  printToThermal(text, sizeId, al, b, inv, 3);
+  printToThermal(text, printScale, al, b, inv, 3);
   server.send(200,"text/plain","Printed!");
 }
 
@@ -961,7 +953,7 @@ void handleTestEvent() {
   }
   if     (type=="sub")  printEvent(tCfg,"TestUser","","");
   else if(type=="bit")  printEvent(tCfg,"TestUser","1000","");
-  else if(type=="pts")  printEvent(tCfg,"TestUser","","Hydrate :> ツ");
+  else if(type=="pts")  printEvent(tCfg,"TestUser","","Hydrate :> \u30C4");
   else if(type=="raid") printEvent(tCfg,"TestUser","","");
   server.send(200,"text/plain","Test Sent");
 }
@@ -971,8 +963,13 @@ void handleTestEvent() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\nESP32-C3 Thermal Printer (Unicode Fallback Mode)");
+  Serial.println("\n\nESP32-C3 Thermal Printer (VLW SPIFFS Fonts)");
   loadConfig();
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  }
+  loadVlw(fontBasic, "/unifont_basic.vlw");
+  loadVlw(fontCJK,   "/unifont_cjk.vlw");
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
