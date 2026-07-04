@@ -41,8 +41,9 @@ File uploadFile;
 size_t uploadExpectedSize = 0;
 size_t uploadWrittenBytes = 0;
 bool uploadFailed = false;
+bool uploadInProgress = false;
 
-#define LOG_BUF_SIZE 4096
+#define LOG_BUF_SIZE 8192
 char logBuffer[LOG_BUF_SIZE];
 size_t logHead = 0;
 bool logWrapped = false;
@@ -83,6 +84,7 @@ struct VlwFont {
   VlwGlyph* glyphs;
   uint8_t*  bitmaps;
   size_t    bitmapBytes;
+  char*     path;       // file path for on-demand bitmap reads
   bool      loaded;
 };
 
@@ -193,19 +195,16 @@ bool loadVlw(VlwFont& f, const char* path) {
     f.glyphs[i].y_off   = (int16_t)read32();
   }
 
-  f.bitmapBytes = file.size() - file.position();
-  f.bitmaps = (uint8_t*)malloc(f.bitmapBytes);
-  if (!f.bitmaps) { free(f.glyphs); file.close(); return false; }
-  file.read(f.bitmaps, f.bitmapBytes);
-  file.close();
-
-  size_t offset = 0;
+  // Store bitmap offsets (no preload — read on demand in drawGlyph)
+  uint32_t bitmapDataStart = file.position();
   for (int i = 0; i < f.count; i++) {
-    f.glyphs[i].bitmapOffset = offset;
+    f.glyphs[i].bitmapOffset = bitmapDataStart;
     int rowBytes = (f.glyphs[i].w + 7) / 8;
-    offset += rowBytes * f.glyphs[i].h;
+    bitmapDataStart += rowBytes * f.glyphs[i].h;
   }
 
+  f.path = strdup(path);
+  file.close();
   f.loaded = true;
   logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs)");
   return true;
@@ -236,11 +235,20 @@ const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
 }
 
 // Draw one glyph into PrintCanvas at (x, baseline_y). Returns advance width.
+// Reads bitmap data from LittleFS on demand (not preloaded into RAM).
 int drawGlyph(PrintCanvas& canvas, const VlwFont& font, const VlwGlyph* g,
               int x, int baseline_y, bool invert) {
   if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
   int rowBytes = (g->w + 7) / 8;
-  const uint8_t* bmp = font.bitmaps + g->bitmapOffset;
+  int bmpBytes = rowBytes * g->h;
+  uint8_t* bmp = (uint8_t*)malloc(bmpBytes);
+  if (!bmp) return g->advance;
+  File f = LittleFS.open(font.path, "r");
+  if (f) {
+    f.seek(g->bitmapOffset);
+    f.read(bmp, bmpBytes);
+    f.close();
+  }
   for (int row = 0; row < g->h; row++) {
     int py = baseline_y + g->y_off + row;
     for (int col = 0; col < g->w; col++) {
@@ -250,6 +258,7 @@ int drawGlyph(PrintCanvas& canvas, const VlwFont& font, const VlwGlyph* g,
       if (set) canvas.drawPixel(px, py, invert ? 0 : 1);
     }
   }
+  free(bmp);
   return g->advance;
 }
 
@@ -779,10 +788,18 @@ void handleUpload() {
     size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
     logMsg("LittleFS free: " + String(freeBytes) + " bytes");
 
+    size_t expected = server.header("Content-Length").toInt();
+    if (expected > 0 && expected > freeBytes) {
+      logMsg("REJECTED: need " + String(expected) + " bytes, only " + String(freeBytes) + " free");
+      uploadFailed = true;
+      return;
+    }
+
     if (LittleFS.exists(filename)) LittleFS.remove(filename);
     uploadFile = LittleFS.open(filename, "w");
     uploadWrittenBytes = 0;
     uploadFailed = false;
+    uploadInProgress = true;
 
     if (!uploadFile) {
       logMsg("Failed to open file for writing");
@@ -803,6 +820,7 @@ void handleUpload() {
   else if (upload.status == UPLOAD_FILE_END) {
     if (uploadFile) uploadFile.close();
     logMsg("Upload end. Total written: " + String(uploadWrittenBytes) + " / expected " + String(upload.totalSize));
+    uploadInProgress = false;
     if (uploadWrittenBytes != upload.totalSize) {
       uploadFailed = true;
       logMsg("SIZE MISMATCH — upload incomplete!");
@@ -811,13 +829,14 @@ void handleUpload() {
   else if (upload.status == UPLOAD_FILE_ABORTED) {
     logMsg("Upload ABORTED by client");
     uploadFailed = true;
+    uploadInProgress = false;
     if (uploadFile) uploadFile.close();
   }
 }
 
 void handleUploadComplete() {
   if (uploadFailed) {
-    server.send(500, "text/plain", "Upload FAILED — file incomplete or write error. Check Serial log.");
+    server.send(500, "text/plain", "Upload FAILED — wrote " + String(uploadWrittenBytes) + " bytes");
   } else {
     server.send(200, "text/plain", "Upload OK: " + String(uploadWrittenBytes) + " bytes written.");
   }
@@ -829,10 +848,11 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   logMsg("\n\nESP32-C3 Thermal Printer (VLW LittleFS Fonts)");
-  if (!LittleFS.begin(true)) {
+  if (!LittleFS.begin(false)) {
     logMsg("LittleFS mount failed");
   }
   loadConfig();
+  // NOTE: custom partition table must provide ~1.5MB+ LittleFS partition.
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
   WiFi.mode(WIFI_STA);
@@ -855,8 +875,15 @@ void setup() {
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
-  server.on("/spiffs_check", []() {
-    String out = "<h2>LittleFS Files</h2><ul>";
+  server.on("/fsinfo", []() {
+    size_t total = LittleFS.totalBytes();
+    size_t used  = LittleFS.usedBytes();
+    size_t free  = total - used;
+    String out = "<h2>LittleFS Info</h2>";
+    out += "<p>Total: " + String(total) + " bytes<br>";
+    out += "Used: " + String(used) + " bytes<br>";
+    out += "Free: " + String(free) + " bytes</p>";
+    out += "<h3>Files</h3><ul>";
     File root = LittleFS.open("/");
     File f = root.openNextFile();
     bool any = false;
@@ -866,7 +893,7 @@ void setup() {
       out += "<li>" + name + " - " + String(f.size()) + " bytes <a href=\"/delete_file?name=" + name + "\" onclick=\"return confirm('Delete " + name + "?')\" style=\"color:#f87171\">[delete]</a></li>";
       f = root.openNextFile();
     }
-    if (!any) out += "<li>No files on LittleFS</li>";
+    if (!any) out += "<li>No files</li>";
     out += "</ul><p><a href=\"/\" style=\"color:#a78bfa\">&larr; Back</a></p>";
     server.send(200, "text/html", out);
   });
@@ -876,7 +903,7 @@ void setup() {
     if (!name.startsWith("/")) name = "/" + name;
     if (!LittleFS.exists(name)) { server.send(404, "text/plain", "Not found: " + name); return; }
     LittleFS.remove(name);
-    server.send(200, "text/html", "<p>Deleted: " + name + "</p><p><a href=\"/spiffs_check\" style=\"color:#a78bfa\">&larr; Back</a></p>");
+    server.send(200, "text/html", "<p>Deleted: " + name + "</p><p><a href=\"/fsinfo\" style=\"color:#a78bfa\">&larr; Back</a></p>");
   });
   server.on("/console", []() {
     String out;
@@ -915,8 +942,10 @@ void loop() {
   server.handleClient();
   static unsigned long lastTwitchRetry = 0, lastPrinterRetry = 0;
   unsigned long now = millis();
-  if(twitchConnected)   handleTwitchIRC();
-  else if(now - lastTwitchRetry  > 10000) { lastTwitchRetry  = now; connectTwitch();   }
-  if(!printerConnected && now - lastPrinterRetry > 15000) { lastPrinterRetry = now; connectPrinter(); }
+  if (!uploadInProgress) {
+    if(twitchConnected)   handleTwitchIRC();
+    else if(now - lastTwitchRetry  > 10000) { lastTwitchRetry  = now; connectTwitch();   }
+    if(!printerConnected && now - lastPrinterRetry > 15000) { lastPrinterRetry = now; connectPrinter(); }
+  }
   delay(10);
 }

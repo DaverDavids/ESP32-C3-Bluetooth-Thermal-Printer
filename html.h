@@ -77,11 +77,11 @@ textarea{height:56px;resize:vertical;font-family:monospace}
   <h2>Upload Font Files</h2>
   <form id="fontForm">
     <input type="file" id="fontFiles" multiple accept=".vlw">
-    <button type="button" onclick="uploadFonts()" class="save">Upload to SPIFFS</button>
+    <button type="button" onclick="uploadFonts()" class="save">Upload to LittleFS</button>
     <div id="uploadStatus" style="font-size:11px;margin-top:6px"></div>
   </form>
   <div style="margin-top:8px;font-size:12px;color:#9ca3af">
-    <a href="/spiffs_check" target="_blank" style="color:#a78bfa">Check uploaded files</a>
+    <a href="/fsinfo" target="_blank" style="color:#a78bfa">Filesystem info</a>
   </div>
 </div>
 
