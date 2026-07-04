@@ -1,142 +1,84 @@
-<img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" style="height:64px;margin-right:32px"/>
 
-# instead of specific web debug code for the upload, can we have a console for all errors instead of over serial? can this be done without much overhead? I don't want to write other files to spiffs or littlefs either. consider this and recommend again all changes to make precisely
 
-A RAM-based ring buffer log is exactly right — near-zero overhead, no SPIFFS writes, works everywhere Serial.print is already used. Here's the precise implementation.
+## Issue 1: Blank Web Page
 
-## 1. Add a Global Log Buffer
-
-Add near the top of `c3Printer.ino`, after existing globals:
+The HTML was moved out to `#include "html.h"` , but `handleRoot` still does:
 
 ```cpp
-#define LOG_BUF_SIZE 4096
-char logBuffer[LOG_BUF_SIZE];
-size_t logHead = 0;
-bool logWrapped = false;
-
-void logMsg(const String& msg) {
-  String line = "[" + String(millis()) + "] " + msg + "\n";
-  for (size_t i = 0; i < line.length(); i++) {
-    logBuffer[logHead] = line[i];
-    logHead = (logHead + 1) % LOG_BUF_SIZE;
-    if (logHead == 0) logWrapped = true;
-  }
-  Serial.print(line);  // still print to Serial when available, costs nothing extra
-}
+server.send(200, "text/html; charset=UTF-8", htmlPage);
 ```
 
-4KB is enough for several hundred log lines and costs 4KB of static RAM — negligible against your 300KB heap.
+`htmlPage` is whatever `html.h` defines. The blank page means one of:
 
-## 2. Add the Console Endpoint
+- **`html.h` doesn't exist in the sketch folder** — it compiled fine (the include resolved) but `htmlPage` is an empty string or a null pointer being cast to String. Check that `html.h` is actually sitting next to `c3Printer.ino` in your local sketch directory.
+- **`html.h` defines `htmlPage` as a `const char*` pointing to a string that starts with a null byte or is empty.** Open the file and verify the first character of the string literal isn't accidentally `\0`.
+- **Encoding issue** — if you saved `html.h` on Windows and it has a UTF-8 BOM, the browser may refuse to render it. Make sure the file is saved as UTF-8 *without* BOM.
 
-```cpp
-void handleConsole() {
-  String out;
-  if (logWrapped) {
-    out += String(logBuffer).substring(logHead);
-    out += String(logBuffer).substring(0, logHead);
-  } else {
-    out = String(logBuffer).substring(0, logHead);
-  }
-  server.send(200, "text/plain", out);
-}
+Quick diagnostic: hit `http://c3printer.local/` and open DevTools → Network. Check the response size. If it's 0 bytes or just `\r\n`, the string is empty. If it's a reasonable size but renders blank, it's a content/encoding issue.
 
-server.on("/console", handleConsole);   // add in setup()
-```
+Also note: **the `#include <SPIFFS.h>` is still there but you said you switched to LittleFS** — that means `SPIFFS.begin()`, `SPIFFS.open()`, `SPIFFS.exists()` etc. are all calling the wrong filesystem. If LittleFS is mounted but SPIFFS isn't, `loadVlw` will fail silently (it logs "VLW missing"), but the web server itself doesn't depend on the filesystem so this wouldn't cause a blank page on its own.
 
-Note: `String(logBuffer)` will stop at the first null byte, which is fine since unwritten buffer space stays zero-initialized.
+***
 
-## 3. Replace Every `Serial.println` / `Serial.printf` Call With `logMsg`
+## Issue 2: Slower Than Before the Font Changes
 
-Search the whole `.ino` for every instance of:
+This is `measureTextVlw` being called **quadratically** in `wordWrap` . Look at the wrapping loop:
 
 ```cpp
-Serial.println("...")
-Serial.printf("...", ...)
-```
-
-Replace with:
-
-```cpp
-logMsg("...")
-logMsg(String("...") + var)   // for printf-style, build the String first
-```
-
-This is a mechanical find-and-replace across the file — every existing debug line becomes visible in `/console` automatically, including all your BLE connect/disconnect, Twitch IRC, WiFi, and upload status messages already in the code .
-
-## 4. Simple Auto-Refreshing Console Page
-
-Add a route serving a minimal live-tailing view:
-
-```cpp
-const char* consolePage = R"rawliteral(
-<!DOCTYPE html><html><head><title>Console</title>
-<style>body{background:#0f0f23;color:#4ade80;font-family:monospace;font-size:12px;padding:10px;white-space:pre-wrap}</style>
-</head><body>
-<div id="log">Loading...</div>
-<script>
-async function tick(){
-  const r = await fetch('/console');
-  document.getElementById('log').textContent = await r.text();
-  window.scrollTo(0, document.body.scrollHeight);
-}
-setInterval(tick, 1000);
-tick();
-</script></body></html>
-)rawliteral";
-
-server.on("/log", []() { server.send(200, "text/html", consolePage); });
-```
-
-Visit `http://c3printer.local/log` — it polls every second and tails the live buffer, giving you a real-time serial-monitor-equivalent entirely over WiFi.
-
-## Applying This to Your Upload Handler Specifically
-
-Update the raw upload handler from before to use `logMsg` instead of `Serial.println`:
-
-```cpp
-void handleRawUpload() {
-  String filename = "/" + server.arg("name");
-  size_t expectedSize = server.header("Content-Length").toInt();
-  logMsg("Upload start: " + filename + " expected " + String(expectedSize) + " bytes, free heap " + String(ESP.getFreeHeap()));
-
-  SPIFFS.remove(filename);
-  File f = SPIFFS.open(filename, "w");
-  if (!f) { logMsg("ERROR: cannot open " + filename); server.send(500, "text/plain", "Cannot open file"); return; }
-
-  WiFiClient client = server.client();
-  size_t written = 0;
-  uint8_t buf[512];
-
-  while (written < expectedSize && client.connected()) {
-    size_t avail = client.available();
-    if (avail) {
-      size_t toRead = min(avail, sizeof(buf));
-      size_t got = client.read(buf, toRead);
-      f.write(buf, got);
-      written += got;
+while (line.length() > 0) {
+    if (measureTextVlw(line) <= maxWidth) { ... break; }   // ← full scan
+    // binary search: calls measureTextVlw on substrings O(log N) times
+    while (lo <= hi) {
+        String test = line.substring(0, mid);
+        if (measureTextVlw(test) <= maxWidth) { ... }      // ← full scan each
     }
-    yield();
-  }
-  f.close();
-  logMsg("Upload end: " + filename + " wrote " + String(written) + "/" + String(expectedSize) + " free heap " + String(ESP.getFreeHeap()));
-
-  if (written == expectedSize) {
-    server.send(200, "text/plain", "OK: " + String(written) + " bytes");
-  } else {
-    logMsg("ERROR: size mismatch on " + filename);
-    server.send(500, "text/plain", "Incomplete: " + String(written) + "/" + String(expectedSize));
-  }
 }
 ```
 
+`measureTextVlw` iterates every codepoint in the substring doing a binary search per glyph. For a long line this runs O(N log N) times inside an outer binary search — easily 50–100× slower than the old U8g2 `getUTF8Width` which was a single tight C loop over precomputed width tables in flash.
 
-## Summary of Exact Changes
+**The fix** is a single linear-scan accumulator instead of repeated full remeasures. Replace `wordWrap` with a codepoint-advance version that walks the string once, tracking cumulative width and last-space position:
 
-1. Add `logBuffer` + `logMsg()` function — 4KB static RAM cost
-2. Add `/console` (raw text) and `/log` (auto-refresh HTML viewer) routes
-3. Global find-replace: every `Serial.println`/`Serial.printf` → `logMsg`
-4. Switch the file upload handler to the raw-body version from before, using `logMsg` for all diagnostics including heap readings at start/end
+```cpp
+String wordWrap(const String& text, int maxWidth) {
+  String result = "";
+  int lineStart = 0, textLen = (int)text.length();
 
-This gives you full serial-equivalent visibility over WiFi with effectively zero performance cost, and directly surfaces exactly where and why the upload is failing — heap level, byte offset, mismatch amount — the next time you try.
+  while (lineStart < textLen) {
+    int lineEnd = text.indexOf('\n', lineStart);
+    if (lineEnd < 0) lineEnd = textLen;
+
+    // Single linear pass: accumulate width, track last space
+    int i = lineStart, lineWidth = 0, lastSpaceI = -1, lastSpaceW = 0;
+    while (i < lineEnd) {
+      if (text[i] == ' ') { lastSpaceI = i; lastSpaceW = lineWidth; }
+      int before = i;
+      uint32_t cp = nextCodepoint(text, i);
+      const VlwFont* sf = nullptr;
+      const VlwGlyph* g = getGlyph(cp, &sf);
+      int adv = g ? g->advance : (fontBasic.size / 2);
+      if (lineWidth + adv > maxWidth && lineWidth > 0) {
+        // break here
+        int breakAt = (lastSpaceI > lineStart) ? lastSpaceI : before;
+        result += text.substring(lineStart, breakAt);
+        result += '\n';
+        lineStart = breakAt;
+        if (lineStart < textLen && text[lineStart] == ' ') lineStart++;
+        lineWidth = 0; lastSpaceI = -1;
+        i = lineStart;
+        lineEnd = text.indexOf('\n', lineStart);
+        if (lineEnd < 0) lineEnd = textLen;
+        continue;
+      }
+      lineWidth += adv;
+    }
+    result += text.substring(lineStart, lineEnd);
+    if (lineEnd < textLen) result += '\n';
+    lineStart = lineEnd + 1;
+  }
+  return result;
+}
+```
+
+This is O(N) per line regardless of how many wraps occur. The old binary-search approach also had a subtle bug where `measureTextVlw` was being called on Arduino `String` substrings that each allocate heap — on the ESP32-C3 with its small heap that's a lot of malloc/free churn mid-render, which adds to the slowness.
 

@@ -8,8 +8,9 @@
 #include <BLEUtils.h>
 #include <BLEClient.h>
 #include <Adafruit_GFX.h>
-#include <SPIFFS.h>
+#include <LittleFS.h>
 #include <Secrets.h>
+#include "html.h"
 
 struct VlwFont;
 struct VlwGlyph;
@@ -167,7 +168,7 @@ void initDefaults() {
 // ========== VLW LOADER ==========
 
 bool loadVlw(VlwFont& f, const char* path) {
-  File file = SPIFFS.open(path, "r");
+  File file = LittleFS.open(path, "r");
   if (!file) { logMsg("VLW missing: " + String(path)); return false; }
 
   auto read32 = [&]() -> int32_t {
@@ -325,30 +326,31 @@ String wordWrap(const String& text, int maxWidth) {
   while (lineStart < textLen) {
     int lineEnd = text.indexOf('\n', lineStart);
     if (lineEnd < 0) lineEnd = textLen;
-    String line = text.substring(lineStart, lineEnd);
 
-    if (measureTextVlw(line) <= maxWidth) {
-      result += line;
-      if (lineEnd < textLen) result += "\n";
-    } else {
-      while (line.length() > 0) {
-        if (measureTextVlw(line) <= maxWidth) { result += line; break; }
-        int lo = 1, hi = (int)line.length(), breakAt = 1;
-        while (lo <= hi) {
-          int mid = (lo + hi) / 2;
-          String test = line.substring(0, mid);
-          if (measureTextVlw(test) <= maxWidth) { breakAt = mid; lo = mid + 1; }
-          else hi = mid - 1;
-        }
-        int lastSpace = line.lastIndexOf(' ', breakAt);
-        if (lastSpace > 0) breakAt = lastSpace;
-        result += line.substring(0, breakAt);
-        result += "\n";
-        line = line.substring(breakAt);
-        if (line.startsWith(" ")) line = line.substring(1);
+    int i = lineStart, lineWidth = 0, lastSpaceI = -1, lastSpaceW = 0;
+    while (i < lineEnd) {
+      if (text[i] == ' ') { lastSpaceI = i; lastSpaceW = lineWidth; }
+      int before = i;
+      uint32_t cp = nextCodepoint(text, i);
+      const VlwFont* sf = nullptr;
+      const VlwGlyph* g = getGlyph(cp, &sf);
+      int adv = g ? g->advance : (fontBasic.size / 2);
+      if (lineWidth + adv > maxWidth && lineWidth > 0) {
+        int breakAt = (lastSpaceI > lineStart) ? lastSpaceI : before;
+        result += text.substring(lineStart, breakAt);
+        result += '\n';
+        lineStart = breakAt;
+        if (lineStart < textLen && text[lineStart] == ' ') lineStart++;
+        lineWidth = 0; lastSpaceI = -1;
+        i = lineStart;
+        lineEnd = text.indexOf('\n', lineStart);
+        if (lineEnd < 0) lineEnd = textLen;
+        continue;
       }
-      if (lineEnd < textLen) result += "\n";
+      lineWidth += adv;
     }
+    result += text.substring(lineStart, lineEnd);
+    if (lineEnd < textLen) result += '\n';
     lineStart = lineEnd + 1;
   }
   return result;
@@ -672,8 +674,6 @@ void saveConfig() {
 
 // ========== WEB SERVER ==========
 
-#include "html.h"
-
 void handleRoot()   { server.send(200, "text/html; charset=UTF-8", htmlPage); }
 
 void handleStatus() {
@@ -776,11 +776,11 @@ void handleUpload() {
     String filename = "/" + upload.filename;
     logMsg("Upload start: " + filename);
 
-    size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
-    logMsg("SPIFFS free: " + String(freeBytes) + " bytes");
+    size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+    logMsg("LittleFS free: " + String(freeBytes) + " bytes");
 
-    if (SPIFFS.exists(filename)) SPIFFS.remove(filename);
-    uploadFile = SPIFFS.open(filename, "w");
+    if (LittleFS.exists(filename)) LittleFS.remove(filename);
+    uploadFile = LittleFS.open(filename, "w");
     uploadWrittenBytes = 0;
     uploadFailed = false;
 
@@ -828,9 +828,9 @@ void handleUploadComplete() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  logMsg("\n\nESP32-C3 Thermal Printer (VLW SPIFFS Fonts)");
-  if (!SPIFFS.begin(true)) {
-    logMsg("SPIFFS mount failed");
+  logMsg("\n\nESP32-C3 Thermal Printer (VLW LittleFS Fonts)");
+  if (!LittleFS.begin(true)) {
+    logMsg("LittleFS mount failed");
   }
   loadConfig();
   loadVlw(fontBasic, "/unifont_basic.vlw");
@@ -856,8 +856,8 @@ void setup() {
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
   server.on("/spiffs_check", []() {
-    String out = "<h2>SPIFFS Files</h2><ul>";
-    File root = SPIFFS.open("/");
+    String out = "<h2>LittleFS Files</h2><ul>";
+    File root = LittleFS.open("/");
     File f = root.openNextFile();
     bool any = false;
     while (f) {
@@ -866,7 +866,7 @@ void setup() {
       out += "<li>" + name + " - " + String(f.size()) + " bytes <a href=\"/delete_file?name=" + name + "\" onclick=\"return confirm('Delete " + name + "?')\" style=\"color:#f87171\">[delete]</a></li>";
       f = root.openNextFile();
     }
-    if (!any) out += "<li>No files on SPIFFS</li>";
+    if (!any) out += "<li>No files on LittleFS</li>";
     out += "</ul><p><a href=\"/\" style=\"color:#a78bfa\">&larr; Back</a></p>";
     server.send(200, "text/html", out);
   });
@@ -874,8 +874,8 @@ void setup() {
     String name = server.arg("name");
     if (name.length() == 0) { server.send(400, "text/plain", "Missing name"); return; }
     if (!name.startsWith("/")) name = "/" + name;
-    if (!SPIFFS.exists(name)) { server.send(404, "text/plain", "Not found: " + name); return; }
-    SPIFFS.remove(name);
+    if (!LittleFS.exists(name)) { server.send(404, "text/plain", "Not found: " + name); return; }
+    LittleFS.remove(name);
     server.send(200, "text/html", "<p>Deleted: " + name + "</p><p><a href=\"/spiffs_check\" style=\"color:#a78bfa\">&larr; Back</a></p>");
   });
   server.on("/console", []() {
