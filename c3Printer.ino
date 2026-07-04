@@ -35,6 +35,10 @@ BLERemoteCharacteristic* pWriteCharacteristic = nullptr;
 bool printerConnected = false;
 bool twitchConnected  = false;
 
+// twitchEverConnected: stays false until BLE reaches BLE_READY on first boot.
+// After that, Twitch reconnects independently of BLE state.
+bool twitchEverConnected = false;
+
 enum BLEConnState { BLE_IDLE, BLE_CONNECTING, BLE_DISCOVERING, BLE_INITING, BLE_READY, BLE_FAILED };
 volatile BLEConnState bleState = BLE_IDLE;
 unsigned long lastTwitchPing = 0;
@@ -73,8 +77,6 @@ void logMsg(const String& msg) {
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
-// PRINT_SCALE: base multiplier (default 2). EventConfig.font[] stores the
-// per-line override (1=Small/16px, 2=Medium/32px, 3=Large/48px on paper).
 #define PRINT_SCALE 2
 
 #define SCALE_SMALL  1
@@ -97,8 +99,8 @@ struct VlwGlyph {
 struct VlwFont {
   int       count;
   int       size;
-  uint32_t  indexStart;        // file offset where glyph entries begin
-  uint32_t* bitmapOffsets;     // per-glyph cumulative bitmap offset array (count × 4 bytes)
+  uint32_t  indexStart;
+  uint32_t* bitmapOffsets;
   char*     path;
   bool      loaded;
 };
@@ -135,7 +137,7 @@ public:
 struct EventConfig {
   bool    enabled = true;
   String  msg[3];
-  uint8_t font[3];   // SCALE_SMALL/MEDIUM/LARGE
+  uint8_t font[3];
   int     align[3];
   bool    bold[3];
   bool    invert[3];
@@ -194,19 +196,18 @@ bool loadVlw(VlwFont& f, const char* path) {
   f.count  = read32();
   int ver  = read32();
   f.size   = read32();
-  read32(); read32(); read32(); // reserved
+  read32(); read32(); read32();
 
   f.indexStart = file.position();
 
-  // Build compact bitmap-offset array (4 bytes per glyph)
   f.bitmapOffsets = (uint32_t*)malloc(f.count * sizeof(uint32_t));
   uint32_t bmpOff = f.indexStart + f.count * 24;
   for (int i = 0; i < f.count; i++) {
     if (f.bitmapOffsets) f.bitmapOffsets[i] = bmpOff;
-    read32(); // cp
+    read32();
     int16_t h = (int16_t)read32();
     int16_t w = (int16_t)read32();
-    read32(); read32(); read32(); // advance, x_off, y_off (discarded)
+    read32(); read32(); read32();
     int rowBytes = (w + 7) / 8;
     bmpOff += rowBytes * h;
   }
@@ -220,12 +221,9 @@ bool loadVlw(VlwFont& f, const char* path) {
 
 // ========== GLYPH LOOKUP ==========
 
-// Binary-search one glyph entry using an already-open file handle.
-// The caller opens the file once per line/chunk and passes it in —
-// this avoids a file open/close per character during rendering.
-// Populates the caller-owned *out struct (including bitmapOffset).
+// Binary-search using an already-open file handle — caller opens once per render job.
 const VlwGlyph* findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* out) {
-  if (!f.loaded || !f.bitmapOffsets) return nullptr;  // null-guard: font failed to load
+  if (!f.loaded || !f.bitmapOffsets) return nullptr;
 
   auto read32 = [&]() -> int32_t {
     uint8_t b[4]; file.read(b, 4);
@@ -244,7 +242,7 @@ const VlwGlyph* findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, V
       out->advance = (int16_t)read32();
       out->x_off   = (int16_t)read32();
       out->y_off   = (int16_t)read32();
-      out->bitmapOffset = f.bitmapOffsets[mid];  // safe: null-guarded above
+      out->bitmapOffset = f.bitmapOffsets[mid];
       return out;
     } else if (midCp < cp) lo = mid + 1;
     else                   hi = mid - 1;
@@ -252,10 +250,7 @@ const VlwGlyph* findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, V
   return nullptr;
 }
 
-// Lookup a glyph by opening the font file internally.
-// Used only for measurement passes (wordWrap / measureTextVlw) where
-// we don't yet have a render-time open file handle.
-// Returns pointer to a static per-font glyph struct — consume before next call.
+// Used only for word-wrap measurement — opens its own file handle since no render handle exists yet.
 const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
   static VlwGlyph cacheBasic, cacheCJK;
 
@@ -287,16 +282,13 @@ const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
   return nullptr;
 }
 
-// Draw one glyph into PrintCanvas at (x, baseline_y). Returns advance width.
-// Accepts an already-open File& for the font — no open/close per glyph.
-// Uses the static glyphBuf[] instead of malloc/free — zero heap churn.
+// Draw one glyph — uses static glyphBuf[], no malloc/free, no file open.
 int drawGlyph(PrintCanvas& canvas, const VlwFont& font, File& fontFile,
               const VlwGlyph* g, int x, int baseline_y, bool invert) {
   if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
   int rowBytes = (g->w + 7) / 8;
   int bmpBytes = rowBytes * g->h;
   if (bmpBytes > MAX_GLYPH_BYTES) {
-    // Glyph too large for static buffer — skip drawing but still advance
     logMsg("WARN: glyph too large for glyphBuf, skipping");
     return g->advance;
   }
@@ -476,8 +468,7 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   int linesPerChunk = max(1, 200 / lineHeight);
   int currentLineIndex = 0, textIndex = 0;
 
-  // Open font files once per printToThermal call — shared across all chunks and glyphs.
-  // This is the primary fix: eliminates per-glyph file open/close overhead.
+  // Open font files once per printToThermal call — reused for all chunks and all glyphs.
   File fBasicHandle, fCJKHandle;
   if (fontBasic.loaded && fontBasic.path) fBasicHandle = LittleFS.open(fontBasic.path, "r");
   if (fontCJK.loaded   && fontCJK.path)   fCJKHandle   = LittleFS.open(fontCJK.path,   "r");
@@ -516,18 +507,14 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
           const VlwGlyph* g = nullptr;
           File* usedFile = nullptr;
 
-          // Try basic font first using the already-open handle
           if (fBasicHandle && fontBasic.loaded && fontBasic.bitmapOffsets) {
             if (findGlyphInOpenFile(fontBasic, fBasicHandle, cp, &glyphOut)) {
-              g = &glyphOut;
-              usedFile = &fBasicHandle;
+              g = &glyphOut; usedFile = &fBasicHandle;
             }
           }
-          // Fall back to CJK font
           if (!g && fCJKHandle && fontCJK.loaded && fontCJK.bitmapOffsets) {
             if (findGlyphInOpenFile(fontCJK, fCJKHandle, cp, &glyphOut)) {
-              g = &glyphOut;
-              usedFile = &fCJKHandle;
+              g = &glyphOut; usedFile = &fCJKHandle;
             }
           }
 
@@ -575,7 +562,6 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
     delay(20);
   }
 
-  // Close font file handles opened for this print job
   if (fBasicHandle) fBasicHandle.close();
   if (fCJKHandle)   fCJKHandle.close();
 
@@ -641,13 +627,16 @@ void parseTwitchMessage(String msg) {
     printEvent(twitchCfg.raids,  extractTag(msg,"display-name"), "", "");
 }
 
+// connectTwitch() — called from loop() only, never from setup().
+// First call is gated on twitchEverConnected being set (i.e. BLE is ready).
+// Subsequent reconnects are independent of BLE state.
 void connectTwitch() {
   if (ESP.getMaxAllocHeap() < 30000) {
     logMsg("Twitch connect SKIPPED: heap too low (maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
     twitchConnected = false;
     return;
   }
-  logMsg("Connecting to Twitch IRC...");
+  logMsg("Connecting to Twitch IRC... heap free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   twitchClient.setInsecure();
   if(twitchClient.connect("irc.chat.twitch.tv", 6697)) {
     twitchClient.println("PASS " TWITCH_OAUTH_SECRET);
@@ -655,6 +644,7 @@ void connectTwitch() {
     twitchClient.println("CAP REQ :twitch.tv/tags twitch.tv/commands");
     twitchClient.println("JOIN #" TWITCH_CHANNEL);
     twitchConnected = true;
+    twitchEverConnected = true;
     lastTwitchPing  = millis();
     logMsg("Twitch OK");
   } else {
@@ -681,7 +671,7 @@ void handleTwitchIRC() {
   }
   if(!twitchClient.connected()) {
     twitchConnected = false;
-    logMsg("Twitch connection lost");
+    logMsg("Twitch connection lost — will retry in 10s");
   }
 }
 
@@ -695,17 +685,19 @@ class MyClientCallback : public BLEClientCallbacks {
   void onDisconnect(BLEClient* p) {
     printerConnected = false;
     bleState = BLE_IDLE;
-    logMsg("BLE Disconnected");
+    logMsg("BLE Disconnected — will retry in 15s");
   }
 };
 
+// connectPrinter() — heap guard raised to 45000 to ensure NimBLE hci buffers
+// can allocate. At 25000 the guard passed but NimBLE still crashed internally.
 void connectPrinter() {
-  if (ESP.getFreeHeap() < 25000 || ESP.getMaxAllocHeap() < 25000) {
+  if (ESP.getFreeHeap() < 45000 || ESP.getMaxAllocHeap() < 45000) {
     logMsg("BLE connect SKIPPED: heap too low (free=" + String(ESP.getFreeHeap()) +
            " maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
     return;
   }
-  logMsg("Connecting: " + printerMAC);
+  logMsg("Connecting BLE: " + printerMAC + " heap free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   BLEDevice::init("ESP32-C3-Printer");
   if(pClient) delete pClient;
   pClient = BLEDevice::createClient();
@@ -999,7 +991,6 @@ void setup() {
   logMsg("After LittleFS. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   loadConfig();
   logMsg("After loadConfig. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
-  // NOTE: partitions.csv: app0 + app1 (1.5MB each) + spiffs ~960KB
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
   logMsg("After VLW load. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
@@ -1015,8 +1006,9 @@ void setup() {
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
   logMsg("After ArduinoOTA. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
-  connectTwitch();
-  logMsg("After Twitch attempt. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
+  // NOTE: connectTwitch() is NOT called here.
+  // BLE connects first in loop(); Twitch connects after BLE_READY is reached.
+  // This ensures NimBLE gets the contiguous heap it needs before TLS allocates.
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
   server.on("/gcfg",     handleGetConfig);
@@ -1097,13 +1089,13 @@ tick();
 )rawliteral");
   });
   server.begin();
-  logMsg("Ready!");
+  logMsg("Ready! Waiting for BLE before Twitch connect.");
 }
 
 void loop() {
-  static unsigned long lastHeapLog = 0;
-  // Delay first BLE attempt 30s to let Twitch TLS stabilize before competing for heap
-  static unsigned long lastPrinterRetry = 30000;
+  static unsigned long lastHeapLog    = 0;
+  static unsigned long lastPrinterRetry = 0;
+  static unsigned long lastTwitchRetry  = 0;
   unsigned long now = millis();
 
   if (now - lastHeapLog > 10000) {
@@ -1126,21 +1118,29 @@ void loop() {
   ArduinoOTA.handle();
   if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
-  static unsigned long lastTwitchRetry = 0;
+
   if (!uploadInProgress) {
-    if(twitchConnected) {
+    // ---- Twitch IRC keep-alive ----
+    if (twitchConnected) {
       unsigned long t0 = micros();
       handleTwitchIRC();
       unsigned long dt = micros() - t0;
       if (dt > 50000) logMsg("WARN: handleTwitchIRC took " + String(dt) + " us");
+    } else if (twitchEverConnected && now - lastTwitchRetry > 10000) {
+      // Reconnect independently — does not wait for BLE state
+      lastTwitchRetry = now;
+      connectTwitch();
     }
-    else if(now - lastTwitchRetry > 10000) { lastTwitchRetry = now; connectTwitch(); }
+
+    // ---- BLE printer connect / reconnect ----
     if (bleState == BLE_IDLE && !printerConnected &&
         now - lastPrinterRetry > 15000 &&
         now - lastUploadFinish > 10000) {
       lastPrinterRetry = now;
       connectPrinter();
     }
+
+    // ---- BLE state machine ----
     if (bleState == BLE_DISCOVERING) {
       static unsigned long discoverStart = 0;
       if (discoverStart == 0) discoverStart = now;
@@ -1163,14 +1163,28 @@ void loop() {
         bleState = BLE_FAILED;
       }
     }
+
     if (bleState == BLE_INITING) {
       printerConnected = true;
       uint8_t wake[] = {0x00,0x00,0x00,0x00,0x00};
       pWriteCharacteristic->writeValue(wake, 5);
       uint8_t init[] = {0x1B, 0x40};
       pWriteCharacteristic->writeValue(init, 2);
-      logMsg("Printer Ready");
+      logMsg("Printer Ready. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
       bleState = BLE_READY;
+
+      // First-ever Twitch connect happens here, right after BLE is ready.
+      // BLE has already consumed its heap; TLS now gets a clean window.
+      if (!twitchEverConnected) {
+        logMsg("BLE ready — initiating first Twitch connect");
+        connectTwitch();
+        lastTwitchRetry = now;
+      }
+    }
+
+    // BLE_FAILED: back to IDLE after a short pause so retry fires
+    if (bleState == BLE_FAILED) {
+      bleState = BLE_IDLE;
     }
   }
   delay(10);
