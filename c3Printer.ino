@@ -106,6 +106,21 @@ const int SIZE_TABLE_LEN = sizeof(SIZE_TABLE) / sizeof(SIZE_TABLE[0]);
 const uint8_t* UNICODE_FALLBACK_FONT = u8g2_font_unifont_t_japanese1;
 const uint8_t  UNICODE_FALLBACK_H    = 16;
 
+// ========== CODEPOINT CLASSIFIERS ==========
+// These MUST be defined before getSizeEntry() and pickFont().
+
+// Returns true if this codepoint is covered by the standard Latin/extended fonts
+// (i.e., ISO-8859 / basic Latin + extended Latin)
+bool isLatinCodepoint(uint32_t cp) {
+  return cp <= 0x024F; // Basic Latin + Latin-1 Supplement + Latin Extended-A/B
+}
+
+bool isBrailleOrBlock(uint32_t cp) {
+  return (cp >= 0x2500 && cp <= 0x257F) ||  // Box Drawing
+         (cp >= 0x2580 && cp <= 0x259F) ||  // Block Elements
+         (cp >= 0x2800 && cp <= 0x28FF);    // Braille Patterns
+}
+
 const SizeEntry* getSizeEntry(uint8_t id) {
   for (int i = 0; i < SIZE_TABLE_LEN; i++)
     if (SIZE_TABLE[i].id == id) return &SIZE_TABLE[i];
@@ -227,18 +242,6 @@ uint32_t nextCodepoint(const String& s, int& i) {
   { uint32_t cp = (c & 0x07); i++; for(int j=0;j<3&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
 }
 
-// Returns true if this codepoint is covered by the standard Latin/extended fonts
-// (i.e., ISO-8859 / basic Latin + extended Latin)
-bool isLatinCodepoint(uint32_t cp) {
-  return cp <= 0x024F; // Basic Latin + Latin-1 Supplement + Latin Extended-A/B
-}
-
-bool isBrailleOrBlock(uint32_t cp) {
-  return (cp >= 0x2500 && cp <= 0x257F) ||  // Box Drawing
-         (cp >= 0x2580 && cp <= 0x259F) ||  // Block Elements
-         (cp >= 0x2800 && cp <= 0x28FF);    // Braille Patterns
-}
-
 // Word-wrap using the wider of the two fonts for accurate measurement on mixed text
 String wordWrap(const String& text, int maxWidth, const uint8_t* primaryFont, const SizeEntry* se = nullptr) {
   U8G2_FOR_ADAFRUIT_GFX u8m;
@@ -332,7 +335,8 @@ void feedPaper(int lines) {
 }
 
 // Draw one text line with automatic font fallback per Unicode segment.
-// Segments of Latin chars use primaryFont; non-Latin uses se->unicodeFallback.
+// Segments of Latin chars use primaryFont; Braille/Block use brailleFallback;
+// all other non-Latin use unicodeFallback.
 // PRINT_SCALE is applied via repeated-row rendering in printToThermal.
 // Returns the width drawn (in canvas pixels, i.e. pre-scale).
 int drawLineMixed(U8G2_FOR_ADAFRUIT_GFX& u8g2, const String& line,
