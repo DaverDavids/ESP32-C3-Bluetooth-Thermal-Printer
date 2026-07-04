@@ -53,14 +53,21 @@ char logBuffer[LOG_BUF_SIZE];
 size_t logHead = 0;
 bool logWrapped = false;
 
-void logMsg(const String& msg) {
-  String line = "[" + String(millis()) + "] " + msg + "\n";
-  for (size_t i = 0; i < line.length(); i++) {
+void logMsg(const char* msg) {
+  char line[LOG_BUF_SIZE > 160 ? 160 : LOG_BUF_SIZE];
+  int len = snprintf(line, sizeof(line), "[%lu] %s\n", millis(), msg);
+  if (len < 0) return;
+  if ((size_t)len >= sizeof(line)) len = sizeof(line) - 1;
+  for (int i = 0; i < len; i++) {
     logBuffer[logHead] = line[i];
     logHead = (logHead + 1) % LOG_BUF_SIZE;
     if (logHead == 0) logWrapped = true;
   }
   Serial.print(line);
+}
+
+void logMsg(const String& msg) {
+  logMsg(msg.c_str());
 }
 
 const int PRINTER_WIDTH       = 400;
@@ -86,10 +93,9 @@ struct VlwGlyph {
 struct VlwFont {
   int       count;
   int       size;
-  VlwGlyph* glyphs;
-  uint8_t*  bitmaps;
-  size_t    bitmapBytes;
-  char*     path;       // file path for on-demand bitmap reads
+  uint32_t  indexStart;        // file offset where glyph entries begin
+  uint32_t* bitmapOffsets;     // per-glyph cumulative bitmap offset array (count × 4 bytes)
+  char*     path;
   bool      loaded;
 };
 
@@ -188,24 +194,19 @@ bool loadVlw(VlwFont& f, const char* path) {
   f.size   = read32();
   read32(); read32(); read32(); // reserved
 
-  f.glyphs = (VlwGlyph*)malloc(f.count * sizeof(VlwGlyph));
-  if (!f.glyphs) { file.close(); return false; }
+  f.indexStart = file.position();
 
+  // Build compact bitmap-offset array (4 bytes per glyph) — avoids ~20 bytes/glyph of full index
+  f.bitmapOffsets = (uint32_t*)malloc(f.count * sizeof(uint32_t));
+  uint32_t bmpOff = f.indexStart + f.count * 24; // first bitmap position
   for (int i = 0; i < f.count; i++) {
-    f.glyphs[i].cp      = (uint32_t)read32();
-    f.glyphs[i].h       = (int16_t)read32();
-    f.glyphs[i].w       = (int16_t)read32();
-    f.glyphs[i].advance = (int16_t)read32();
-    f.glyphs[i].x_off   = (int16_t)read32();
-    f.glyphs[i].y_off   = (int16_t)read32();
-  }
-
-  // Store bitmap offsets (no preload — read on demand in drawGlyph)
-  uint32_t bitmapDataStart = file.position();
-  for (int i = 0; i < f.count; i++) {
-    f.glyphs[i].bitmapOffset = bitmapDataStart;
-    int rowBytes = (f.glyphs[i].w + 7) / 8;
-    bitmapDataStart += rowBytes * f.glyphs[i].h;
+    if (f.bitmapOffsets) f.bitmapOffsets[i] = bmpOff;
+    read32(); // cp
+    int16_t h = (int16_t)read32();
+    int16_t w = (int16_t)read32();
+    read32(); read32(); read32(); // advance, x_off, y_off (discarded)
+    int rowBytes = (w + 7) / 8;
+    bmpOff += rowBytes * h;
   }
 
   f.path = strdup(path);
@@ -217,24 +218,52 @@ bool loadVlw(VlwFont& f, const char* path) {
 
 // ========== GLYPH LOOKUP + DRAW ==========
 
-const VlwGlyph* findGlyph(const VlwFont& f, uint32_t cp) {
-  if (!f.loaded) return nullptr;
+// Binary-search one glyph entry from the VLW file on LittleFS.
+// Populates the caller-owned *out struct (including bitmapOffset).
+const VlwGlyph* findGlyphInFile(const VlwFont& f, uint32_t cp, VlwGlyph* out) {
+  if (!f.loaded || !f.bitmapOffsets) return nullptr;
+  File file = LittleFS.open(f.path, "r");
+  if (!file) return nullptr;
+
+  auto read32 = [&]() -> int32_t {
+    uint8_t b[4]; file.read(b, 4);
+    return (b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+  };
+
   int lo = 0, hi = f.count - 1;
   while (lo <= hi) {
     int mid = (lo + hi) / 2;
-    if      (f.glyphs[mid].cp == cp) return &f.glyphs[mid];
-    else if (f.glyphs[mid].cp  < cp) lo = mid + 1;
-    else                              hi = mid - 1;
+    file.seek(f.indexStart + mid * 24);
+    uint32_t midCp = (uint32_t)read32();
+    if (midCp == cp) {
+      out->cp = midCp;
+      out->h  = (int16_t)read32();
+      out->w  = (int16_t)read32();
+      out->advance = (int16_t)read32();
+      out->x_off   = (int16_t)read32();
+      out->y_off   = (int16_t)read32();
+      out->bitmapOffset = f.bitmapOffsets[mid];
+      file.close();
+      return out;
+    } else if (midCp < cp) lo = mid + 1;
+    else                   hi = mid - 1;
   }
+  file.close();
   return nullptr;
 }
 
-// Returns glyph + owning font pointer; basic first, then CJK.
+// Returns glyph + owning font pointer using a single-entry static cache per font.
+// Callers consume the pointer immediately (before the next getGlyph call).
 const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
-  const VlwGlyph* g = findGlyph(fontBasic, cp);
-  if (g) { if (outFont) *outFont = &fontBasic; return g; }
-  g = findGlyph(fontCJK, cp);
-  if (g) { if (outFont) *outFont = &fontCJK;   return g; }
+  static VlwGlyph cacheBasic, cacheCJK;
+  if (findGlyphInFile(fontBasic, cp, &cacheBasic)) {
+    if (outFont) *outFont = &fontBasic;
+    return &cacheBasic;
+  }
+  if (findGlyphInFile(fontCJK, cp, &cacheCJK)) {
+    if (outFont) *outFont = &fontCJK;
+    return &cacheCJK;
+  }
   if (outFont) *outFont = nullptr;
   return nullptr;
 }
@@ -625,7 +654,7 @@ class MyClientCallback : public BLEClientCallbacks {
 };
 
 void connectPrinter() {
-  if (ESP.getFreeHeap() < 40000 || ESP.getMaxAllocHeap() < 30000) {
+  if (ESP.getFreeHeap() < 25000 || ESP.getMaxAllocHeap() < 25000) {
     logMsg("BLE connect SKIPPED: heap too low (free=" + String(ESP.getFreeHeap()) +
            " maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
     return;
@@ -1032,7 +1061,10 @@ void loop() {
   if (now - lastHeapLog > 10000) {
     lastHeapLog = now;
     int rssi = WiFi.RSSI();
-    logMsg("Uptime " + String(now / 1000) + "s  Free heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()) + "  RSSI " + String(rssi) + "dBm");
+    char hb[128];
+    snprintf(hb, sizeof(hb), "Uptime %lus  Free heap: %u MaxAlloc: %u RSSI %ddBm",
+             now / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), rssi);
+    logMsg(hb);
   }
 
   wl_status_t wifiStatus = WiFi.status();
