@@ -35,8 +35,8 @@ BLERemoteCharacteristic* pWriteCharacteristic = nullptr;
 bool printerConnected = false;
 bool twitchConnected  = false;
 
-// twitchEverConnected: stays false until BLE reaches BLE_READY on first boot.
-// After that, Twitch reconnects independently of BLE state.
+// twitchEverConnected: false until BLE reaches BLE_READY (or BLE fails and
+// we fall back). After that, Twitch reconnects independently of BLE state.
 bool twitchEverConnected = false;
 
 enum BLEConnState { BLE_IDLE, BLE_CONNECTING, BLE_DISCOVERING, BLE_INITING, BLE_READY, BLE_FAILED };
@@ -78,13 +78,10 @@ const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
 #define PRINT_SCALE 2
-
 #define SCALE_SMALL  1
 #define SCALE_MEDIUM 2
 #define SCALE_LARGE  3
 
-// Static reusable glyph bitmap buffer — sized for the largest possible VLW glyph
-// (64x64 px = 512 bytes). Eliminates per-glyph malloc/free heap churn.
 #define MAX_GLYPH_BYTES 512
 static uint8_t glyphBuf[MAX_GLYPH_BYTES];
 
@@ -221,7 +218,6 @@ bool loadVlw(VlwFont& f, const char* path) {
 
 // ========== GLYPH LOOKUP ==========
 
-// Binary-search using an already-open file handle — caller opens once per render job.
 const VlwGlyph* findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* out) {
   if (!f.loaded || !f.bitmapOffsets) return nullptr;
 
@@ -250,7 +246,6 @@ const VlwGlyph* findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, V
   return nullptr;
 }
 
-// Used only for word-wrap measurement — opens its own file handle since no render handle exists yet.
 const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
   static VlwGlyph cacheBasic, cacheCJK;
 
@@ -282,7 +277,6 @@ const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
   return nullptr;
 }
 
-// Draw one glyph — uses static glyphBuf[], no malloc/free, no file open.
 int drawGlyph(PrintCanvas& canvas, const VlwFont& font, File& fontFile,
               const VlwGlyph* g, int x, int baseline_y, bool invert) {
   if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
@@ -468,7 +462,6 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   int linesPerChunk = max(1, 200 / lineHeight);
   int currentLineIndex = 0, textIndex = 0;
 
-  // Open font files once per printToThermal call — reused for all chunks and all glyphs.
   File fBasicHandle, fCJKHandle;
   if (fontBasic.loaded && fontBasic.path) fBasicHandle = LittleFS.open(fontBasic.path, "r");
   if (fontCJK.loaded   && fontCJK.path)   fCJKHandle   = LittleFS.open(fontCJK.path,   "r");
@@ -628,8 +621,6 @@ void parseTwitchMessage(String msg) {
 }
 
 // connectTwitch() — called from loop() only, never from setup().
-// First call is gated on twitchEverConnected being set (i.e. BLE is ready).
-// Subsequent reconnects are independent of BLE state.
 void connectTwitch() {
   if (ESP.getMaxAllocHeap() < 30000) {
     logMsg("Twitch connect SKIPPED: heap too low (maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
@@ -679,8 +670,9 @@ void handleTwitchIRC() {
 
 class MyClientCallback : public BLEClientCallbacks {
   void onConnect(BLEClient* p) {
-    logMsg("BLE Connected");
-    if (bleState == BLE_CONNECTING) bleState = BLE_DISCOVERING;
+    logMsg("BLE onConnect fired");
+    // bleState advance is handled in the BLE_CONNECTING poll in loop()
+    // so we don't set BLE_DISCOVERING here — the poll detects isConnected()
   }
   void onDisconnect(BLEClient* p) {
     printerConnected = false;
@@ -689,8 +681,8 @@ class MyClientCallback : public BLEClientCallbacks {
   }
 };
 
-// connectPrinter() — heap guard raised to 45000 to ensure NimBLE hci buffers
-// can allocate. At 25000 the guard passed but NimBLE still crashed internally.
+// connectPrinter() — non-blocking connect (false). Loop polls isConnected()
+// with a 15s timeout rather than blocking the entire loop() for 30s.
 void connectPrinter() {
   if (ESP.getFreeHeap() < 45000 || ESP.getMaxAllocHeap() < 45000) {
     logMsg("BLE connect SKIPPED: heap too low (free=" + String(ESP.getFreeHeap()) +
@@ -699,11 +691,11 @@ void connectPrinter() {
   }
   logMsg("Connecting BLE: " + printerMAC + " heap free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   BLEDevice::init("ESP32-C3-Printer");
-  if(pClient) delete pClient;
+  if(pClient) { delete pClient; pClient = nullptr; }
   pClient = BLEDevice::createClient();
   pClient->setClientCallbacks(new MyClientCallback());
   bleState = BLE_CONNECTING;
-  pClient->connect(BLEAddress(printerMAC.c_str()), true);
+  pClient->connect(BLEAddress(printerMAC.c_str()), false);  // non-blocking
 }
 
 void disconnectPrinter() {
@@ -1006,9 +998,9 @@ void setup() {
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
   logMsg("After ArduinoOTA. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
-  // NOTE: connectTwitch() is NOT called here.
-  // BLE connects first in loop(); Twitch connects after BLE_READY is reached.
-  // This ensures NimBLE gets the contiguous heap it needs before TLS allocates.
+  // connectTwitch() intentionally NOT called here.
+  // BLE connects first via loop(); Twitch connects once BLE_INITING completes.
+  // If BLE fails repeatedly, Twitch falls back after first BLE_FAILED.
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
   server.on("/gcfg",     handleGetConfig);
@@ -1089,21 +1081,22 @@ tick();
 )rawliteral");
   });
   server.begin();
-  logMsg("Ready! Waiting for BLE before Twitch connect.");
+  logMsg("Ready! BLE will connect first, Twitch after.");
 }
 
 void loop() {
-  static unsigned long lastHeapLog    = 0;
+  static unsigned long lastHeapLog      = 0;
   static unsigned long lastPrinterRetry = 0;
   static unsigned long lastTwitchRetry  = 0;
+  static unsigned long connectStart     = 0;  // BLE_CONNECTING timeout tracker
+  static unsigned long discoverStart    = 0;  // BLE_DISCOVERING timeout tracker
   unsigned long now = millis();
 
   if (now - lastHeapLog > 10000) {
     lastHeapLog = now;
-    int rssi = WiFi.RSSI();
     char hb[128];
-    snprintf(hb, sizeof(hb), "Uptime %lus  Free heap: %u MaxAlloc: %u RSSI %ddBm",
-             now / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), rssi);
+    snprintf(hb, sizeof(hb), "Uptime %lus  Free heap: %u MaxAlloc: %u RSSI %ddBm bleState: %d twitch: %d",
+             now / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), WiFi.RSSI(), (int)bleState, (int)twitchConnected);
     logMsg(hb);
   }
 
@@ -1120,6 +1113,7 @@ void loop() {
   server.handleClient();
 
   if (!uploadInProgress) {
+
     // ---- Twitch IRC keep-alive ----
     if (twitchConnected) {
       unsigned long t0 = micros();
@@ -1127,7 +1121,6 @@ void loop() {
       unsigned long dt = micros() - t0;
       if (dt > 50000) logMsg("WARN: handleTwitchIRC took " + String(dt) + " us");
     } else if (twitchEverConnected && now - lastTwitchRetry > 10000) {
-      // Reconnect independently — does not wait for BLE state
       lastTwitchRetry = now;
       connectTwitch();
     }
@@ -1137,12 +1130,28 @@ void loop() {
         now - lastPrinterRetry > 15000 &&
         now - lastUploadFinish > 10000) {
       lastPrinterRetry = now;
+      connectStart = 0;
       connectPrinter();
     }
 
-    // ---- BLE state machine ----
-    if (bleState == BLE_DISCOVERING) {
-      static unsigned long discoverStart = 0;
+    // ---- BLE_CONNECTING: poll isConnected() with 15s timeout ----
+    if (bleState == BLE_CONNECTING && pClient) {
+      if (connectStart == 0) connectStart = now;
+      if (pClient->isConnected()) {
+        logMsg("BLE connection established");
+        connectStart = 0;
+        bleState = BLE_DISCOVERING;
+        discoverStart = 0;
+      } else if (now - connectStart > 15000) {
+        logMsg("BLE connect timeout — will retry in 15s");
+        pClient->disconnect();
+        connectStart = 0;
+        bleState = BLE_FAILED;
+      }
+    }
+
+    // ---- BLE_DISCOVERING: service/characteristic discovery with 10s timeout ----
+    if (bleState == BLE_DISCOVERING && pClient) {
       if (discoverStart == 0) discoverStart = now;
       BLERemoteService* svc = pClient->getService(serviceUUID);
       if (svc) {
@@ -1164,6 +1173,7 @@ void loop() {
       }
     }
 
+    // ---- BLE_INITING: send wake + init bytes, mark ready ----
     if (bleState == BLE_INITING) {
       printerConnected = true;
       uint8_t wake[] = {0x00,0x00,0x00,0x00,0x00};
@@ -1173,8 +1183,7 @@ void loop() {
       logMsg("Printer Ready. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
       bleState = BLE_READY;
 
-      // First-ever Twitch connect happens here, right after BLE is ready.
-      // BLE has already consumed its heap; TLS now gets a clean window.
+      // First-ever Twitch connect: BLE heap is now settled, TLS gets a clean window.
       if (!twitchEverConnected) {
         logMsg("BLE ready — initiating first Twitch connect");
         connectTwitch();
@@ -1182,8 +1191,15 @@ void loop() {
       }
     }
 
-    // BLE_FAILED: back to IDLE after a short pause so retry fires
+    // ---- BLE_FAILED: if Twitch never connected yet, connect it now as fallback ----
+    // This handles the case where the printer is off/out of range at boot
+    // but the stream is live. Twitch will start regardless after first failure.
     if (bleState == BLE_FAILED) {
+      if (!twitchEverConnected) {
+        logMsg("BLE failed — connecting Twitch as fallback");
+        connectTwitch();
+        lastTwitchRetry = now;
+      }
       bleState = BLE_IDLE;
     }
   }
