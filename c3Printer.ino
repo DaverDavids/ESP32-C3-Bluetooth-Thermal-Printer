@@ -434,7 +434,6 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
   unsigned long tStart = millis();
 
-  LittleFS.begin(false, "/littlefs", 4);
   text = processNewlines(text);
   if (printScale < 1) printScale = 1;
   if (printScale > 3) printScale = 3;
@@ -443,7 +442,8 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   const int renderW     = PRINTER_WIDTH / printScale;
   const int maxTextW    = renderW - 8;
   const int lineSpacing = 3;
-  const int lineHeight  = vlwSize + lineSpacing;
+  const int descender   = 8;
+  const int lineHeight  = vlwSize + lineSpacing + descender;
   const int baseline    = vlwSize;
 
   File fBasicHandle, fCJKHandle;
@@ -504,6 +504,11 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
     }
 
     {
+      if (ESP.getMaxAllocHeap() < 12000) {
+        logMsg("SKIP chunk: heap too low maxAlloc=" + String(ESP.getMaxAllocHeap()));
+        currentLineIndex += chunkLineCount;
+        continue;
+      }
       int scaledH      = chunkHeight * printScale;
       int scaledWBytes = PRINTER_WIDTH / 8;
       int renderWBytes = renderW / 8;
