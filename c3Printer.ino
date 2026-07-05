@@ -175,9 +175,8 @@ void initDefaults() {
 // ========== VLW LOADER ==========
 
 bool loadVlw(VlwFont& f, const char* path) {
-  LittleFS.begin(true, "/littlefs", 4);
   File file = LittleFS.open(path, "r");
-  if (!file) { LittleFS.end(); logMsg("VLW missing: " + String(path)); return false; }
+  if (!file) { logMsg("VLW missing: " + String(path)); return false; }
   auto read32 = [&]() -> int32_t {
     uint8_t b[4]; file.read(b, 4);
     return (int32_t)((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]);
@@ -188,7 +187,6 @@ bool loadVlw(VlwFont& f, const char* path) {
   read32(); read32(); read32();
   f.indexStart = file.position();
   file.close();
-  LittleFS.end();
   if (f.path) free(f.path);
   f.path   = strdup(path);
   f.loaded = true;
@@ -225,13 +223,16 @@ bool findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* ou
     uint32_t midCp = (uint32_t)read32at(f.indexStart + mid * 24);
     if (midCp == cp) {
       file.seek(f.indexStart + mid * 24 + 4);
-      uint8_t b[20]; file.read(b, 20);
+      auto read32 = [&]() -> int32_t {
+        uint8_t b[4]; file.read(b, 4);
+        return (int32_t)((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]);
+      };
       out->cp      = cp;
-      out->h       = (int16_t)((b[0]<<8)|b[1]);
-      out->w       = (int16_t)((b[4]<<8)|b[5]);
-      out->advance = (int16_t)((b[8]<<8)|b[9]);
-      out->x_off   = (int16_t)((b[12]<<8)|b[13]);
-      out->y_off   = (int16_t)((b[16]<<8)|b[17]);
+      out->h       = (int16_t)read32();
+      out->w       = (int16_t)read32();
+      out->advance = (int16_t)read32();
+      out->x_off   = (int16_t)read32();
+      out->y_off   = (int16_t)read32();
       out->bitmapOffset = findGlyphOffset(f, file, mid);
       return true;
     } else if (midCp < cp) lo = mid + 1;
@@ -375,18 +376,22 @@ void sendCmd(const uint8_t* cmd, size_t len) {
 void printBitmap(uint8_t *bitmap, int width, int height) {
   if(!printerConnected || !bitmap) return;
   int widthBytes = width / 8;
-  uint8_t cmd[] = {
-    0x1D, 0x76, 0x30, 0x00,
-    (uint8_t)(widthBytes & 0xFF), (uint8_t)(widthBytes >> 8),
-    (uint8_t)(height     & 0xFF), (uint8_t)(height     >> 8)
-  };
-  pWriteCharacteristic->writeValue(cmd, 8); delay(10);
-  int totalBytes = widthBytes * height, chunkSize = 200;
-  for(int i = 0; i < totalBytes; i += chunkSize) {
-    int sendSize = min(chunkSize, totalBytes - i);
-    pWriteCharacteristic->writeValue(&bitmap[i], sendSize);
+  int totalData  = widthBytes * height;
+  uint8_t* packet = (uint8_t*)malloc(8 + totalData);
+  if (!packet) { logMsg("printBitmap malloc failed"); return; }
+  packet[0] = 0x1D; packet[1] = 0x76; packet[2] = 0x30; packet[3] = 0x00;
+  packet[4] = (uint8_t)(widthBytes & 0xFF);
+  packet[5] = (uint8_t)(widthBytes >> 8);
+  packet[6] = (uint8_t)(height & 0xFF);
+  packet[7] = (uint8_t)(height >> 8);
+  memcpy(packet + 8, bitmap, totalData);
+  int chunkSize = 200;
+  for(int i = 0; i < 8 + totalData; i += chunkSize) {
+    int sz = min(chunkSize, 8 + totalData - i);
+    pWriteCharacteristic->writeValue(&packet[i], sz);
     delay(10);
   }
+  free(packet);
 }
 
 void feedPaper(int lines) {
@@ -425,8 +430,6 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   if(!printerConnected) return false;
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
   unsigned long tStart = millis();
-
-  LittleFS.begin(false, "/littlefs", 4);
 
   text = processNewlines(text);
   if (printScale < 1) printScale = 1;
@@ -527,7 +530,6 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
 
   if (fBasicHandle) fBasicHandle.close();
   if (fCJKHandle)   fCJKHandle.close();
-  LittleFS.end();
   if(feedLines > 0) feedPaper(feedLines);
   unsigned long dt = millis() - tStart;
   if (dt > 1000) logMsg("printToThermal took " + String(dt) + " ms");
@@ -880,7 +882,6 @@ void handleUpload() {
     // Reload font metadata if a VLW was just uploaded
     if (upload.filename == "unifont_basic.vlw") loadVlw(fontBasic, "/unifont_basic.vlw");
     if (upload.filename == "unifont_cjk.vlw")   loadVlw(fontCJK,   "/unifont_cjk.vlw");
-    LittleFS.end();
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     logMsg("Upload ABORTED");
     uploadFailed = true; uploadInProgress = false;
@@ -909,6 +910,19 @@ void setup() {
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
   LittleFS.end();
+  // Diagnostic: verify glyph 'A' can be read from the font file
+  LittleFS.begin(false, "/littlefs", 4);
+  {
+    File df = LittleFS.open(fontBasic.path, "r");
+    VlwGlyph dg;
+    if (df && findGlyphInOpenFile(fontBasic, df, 'A', &dg))
+      logMsg("GlyphA w=" + String(dg.w) + " h=" + String(dg.h) +
+             " adv=" + String(dg.advance) + " off=" + String(dg.bitmapOffset));
+    else
+      logMsg("GlyphA NOT FOUND");
+    if (df) df.close();
+  }
+  LittleFS.end();
   logMsg("After VLW. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
 
   WiFi.mode(WIFI_STA);
@@ -933,7 +947,6 @@ void setup() {
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload",   HTTP_POST, handleUploadComplete, handleUpload);
   server.on("/fsinfo", []() {
-    LittleFS.begin(false, "/littlefs", 4);
     size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
     String out = "<h2>LittleFS Info</h2>";
     out += "<p>Total: "+String(total)+" used: "+String(used)+" free: "+String(total-used)+"</p><ul>";
@@ -947,16 +960,13 @@ void setup() {
     }
     if (!any) out += "<li>No files</li>";
     out += "</ul><p><a href=\"/\">&larr; Back</a></p>";
-    LittleFS.end();
     server.send(200, "text/html", out);
   });
   server.on("/delete_file", []() {
-    LittleFS.begin(false, "/littlefs", 4);
     String name = server.arg("name");
     if (!name.startsWith("/")) name = "/"+name;
-    if (!LittleFS.exists(name)) { LittleFS.end(); server.send(404,"text/plain","Not found"); return; }
+    if (!LittleFS.exists(name)) { server.send(404,"text/plain","Not found"); return; }
     LittleFS.remove(name);
-    LittleFS.end();
     server.send(200,"text/html","<p>Deleted: "+name+"</p><a href=\"/fsinfo\">&larr; Back</a>");
   });
   server.on("/console", []() {
@@ -964,6 +974,39 @@ void setup() {
     if (logWrapped) { out = String(logBuffer + logHead) + String(logBuffer, logHead); }
     else            { out = String(logBuffer, logHead); }
     server.send(200, "text/plain", out);
+  });
+  server.on("/test_raw", []() {
+    if (!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
+    uint8_t bmp[400] = {0};
+    for (int i = 0; i < 400; i++) bmp[i] = 0xAA;
+    printBitmap(bmp, 400, 8);
+    feedPaper(3);
+    server.send(200,"text/plain","Raw bitmap sent");
+  });
+  server.on("/test_width", []() {
+    if (!printerConnected) { server.send(400,"text/plain","No printer"); return; }
+    int widths[] = {384, 400, 416, 576};
+    for (int w : widths) {
+      int wb = w / 8;
+      uint8_t* bmp = (uint8_t*)malloc(wb * 2);
+      if (!bmp) continue;
+      memset(bmp, 0xFF, wb * 2);
+      uint8_t cmd[] = {
+        0x1D, 0x76, 0x30, 0x00,
+        (uint8_t)(wb & 0xFF), (uint8_t)(wb >> 8),
+        0x02, 0x00
+      };
+      pWriteCharacteristic->writeValue(cmd, 8); delay(10);
+      int total = wb * 2;
+      for (int i = 0; i < total; i += 200) {
+        int sz = min(200, total - i);
+        pWriteCharacteristic->writeValue(&bmp[i], sz); delay(10);
+      }
+      free(bmp);
+      feedPaper(2);
+      delay(500);
+    }
+    server.send(200,"text/plain","Width test sent");
   });
   server.on("/ping", []() { server.send(200,"text/plain","pong"); });
   server.on("/log", []() {
