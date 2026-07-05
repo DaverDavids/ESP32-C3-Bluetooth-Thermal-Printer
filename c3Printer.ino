@@ -3,7 +3,7 @@
 #include <ESPmDNS.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
-#include <Update.h>
+
 #include <ArduinoOTA.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -48,12 +48,7 @@ unsigned long lastTwitchPing = 0;
 
 String pointsRewardFilter = "";
 bool shouldSaveConfig = false;
-File uploadFile;
-size_t uploadExpectedSize = 0;
-size_t uploadWrittenBytes = 0;
-bool uploadFailed = false;
-bool uploadInProgress = false;
-unsigned long lastUploadFinish = 0;
+
 
 #define LOG_BUF_SIZE 8192
 char logBuffer[LOG_BUF_SIZE];
@@ -866,97 +861,7 @@ void handleTestEvent() {
   server.send(200,"text/plain","Test Sent");
 }
 
-// ========== FIRMWARE UPDATE ==========
 
-void handleFirmwareUpload() {
-  HTTPUpload& upload = server.upload();
-  if (upload.status == UPLOAD_FILE_START) {
-    if (printerConnected || bleState == BLE_CONNECTING || bleState == BLE_DISCOVERING) {
-      logMsg("Disconnecting BLE before firmware upload");
-      disconnectPrinter();
-      delay(200);
-    }
-    logMsg("Firmware upload start: " + upload.filename + " free heap " + String(ESP.getFreeHeap()));
-    if (ESP.getMaxAllocHeap() < 20000) {
-      logMsg("REJECTED firmware upload: MaxAlloc too low (" + String(ESP.getMaxAllocHeap()) + ")");
-      return;
-    }
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH))
-      logMsg("Update.begin failed: " + String(Update.errorString()));
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
-      logMsg("Update.write failed: " + String(Update.errorString()));
-  } else if (upload.status == UPLOAD_FILE_END) {
-    lastUploadFinish = millis();
-    if (Update.end(true)) logMsg("Firmware update SUCCESS, " + String(upload.totalSize) + " bytes, rebooting");
-    else                  logMsg("Update.end failed: " + String(Update.errorString()));
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Update.abort();
-    logMsg("Firmware upload ABORTED");
-  }
-}
-
-// ========== FILE UPLOAD ==========
-
-void handleUpload() {
-  HTTPUpload& upload = server.upload();
-  if (upload.status == UPLOAD_FILE_START) {
-    if (printerConnected || bleState == BLE_CONNECTING || bleState == BLE_DISCOVERING) {
-      logMsg("Disconnecting BLE before upload to free heap");
-      disconnectPrinter();
-      delay(200);
-    }
-    logMsg("Free heap before upload: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
-    if (ESP.getMaxAllocHeap() < 20000) {
-      logMsg("REJECTED upload: MaxAlloc too low — reboot device first");
-      uploadFailed = true;
-      return;
-    }
-    String filename = "/" + upload.filename;
-    logMsg("Upload start: " + filename);
-    size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
-    size_t expected  = server.header("Content-Length").toInt();
-    if (expected > 0 && expected > freeBytes) {
-      logMsg("REJECTED: need " + String(expected) + " bytes, only " + String(freeBytes) + " free");
-      uploadFailed = true;
-      return;
-    }
-    if (LittleFS.exists(filename)) LittleFS.remove(filename);
-    uploadFile = LittleFS.open(filename, "w");
-    uploadWrittenBytes = 0;
-    uploadFailed       = false;
-    uploadInProgress   = true;
-    if (!uploadFile) { logMsg("Failed to open file for writing"); uploadFailed = true; }
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile && !uploadFailed) {
-      size_t written = uploadFile.write(upload.buf, upload.currentSize);
-      uploadWrittenBytes += written;
-      if (written != upload.currentSize) {
-        logMsg("WRITE MISMATCH: expected " + String(upload.currentSize) + ", wrote " + String(written));
-        uploadFailed = true;
-      }
-    }
-    yield();
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (uploadFile) uploadFile.close();
-    logMsg("Upload end: " + String(uploadWrittenBytes) + " bytes written");
-    uploadInProgress = false;
-    lastUploadFinish = millis();
-    if (uploadWrittenBytes == 0) { uploadFailed = true; logMsg("Upload wrote zero bytes"); }
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    logMsg("Upload ABORTED by client");
-    uploadFailed     = true;
-    uploadInProgress = false;
-    if (uploadFile) uploadFile.close();
-  }
-}
-
-void handleUploadComplete() {
-  if (uploadFailed)
-    server.send(500, "text/plain", "Upload FAILED — wrote " + String(uploadWrittenBytes) + " bytes");
-  else
-    server.send(200, "text/plain", "Upload OK: " + String(uploadWrittenBytes) + " bytes written.");
-}
 
 // ========== SETUP & LOOP ==========
 
@@ -992,16 +897,6 @@ void setup() {
   server.on("/f",        handleFeed);
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
-  server.on("/upload",   HTTP_POST, handleUploadComplete, handleUpload);
-  server.on("/ota_upload", HTTP_POST,
-    [](){
-      server.sendHeader("Connection", "close");
-      server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
-      delay(300);
-      ESP.restart();
-    },
-    handleFirmwareUpload
-  );
   server.on("/fsinfo", []() {
     size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
     String out = "<h2>LittleFS Info</h2>";
@@ -1080,8 +975,6 @@ void loop() {
   if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
 
-  if (!uploadInProgress) {
-
     // ---- Twitch IRC keep-alive / connect ----
     if (twitchConnected) {
       unsigned long t0 = micros();
@@ -1101,8 +994,7 @@ void loop() {
 
     // ---- BLE printer connect / reconnect ----
     if (bleState == BLE_IDLE && !printerConnected &&
-        now - lastPrinterRetry > 15000 &&
-        now - lastUploadFinish > 10000) {
+        now - lastPrinterRetry > 15000) {
       lastPrinterRetry = now;
       connectStart = 0;
       connectPrinter();
@@ -1170,6 +1062,5 @@ void loop() {
       }
       bleState = BLE_IDLE;
     }
-  }
   delay(10);
 }

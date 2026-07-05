@@ -73,25 +73,6 @@ textarea{height:56px;resize:vertical;font-family:monospace}
   </div>
 </div>
 
-<div class="card">
-  <h2>Upload Font Files</h2>
-  <form id="fontForm">
-    <input type="file" id="fontFiles" multiple accept=".vlw">
-    <button type="button" onclick="uploadFonts()" class="save">Upload to LittleFS</button>
-    <div id="uploadStatus" style="font-size:11px;margin-top:6px"></div>
-  </form>
-  <div style="margin-top:8px;font-size:12px;color:#9ca3af">
-    <a href="/fsinfo" target="_blank" style="color:#a78bfa">Filesystem info</a>
-  </div>
-</div>
-
-<div class="card">
-  <h2>Firmware Update</h2>
-  <input type="file" id="fwFile" accept=".bin">
-  <button class="save" onclick="uploadFirmware()">Flash Firmware</button>
-  <div id="fwStatus" style="font-size:11px;margin-top:6px;color:#9ca3af"></div>
-</div>
-
 <script>
 // Size values are PRINT_SCALE multipliers: 1=Small(16px), 2=Medium(32px), 3=Large(48px)
 const SIZES = [
@@ -208,40 +189,6 @@ function testPrint() {
 
 function feed()      { fetch('/f?lines=3'); }
 function doConnect() { fetch('/c').then(r=>r.text()).then(alert); }
-
-async function uploadFonts() {
-  const files = document.getElementById('fontFiles').files;
-  const status = document.getElementById('uploadStatus');
-  status.innerHTML = 'Tip: reboot device first if uploads keep failing.<br>';
-  for (const file of files) {
-    status.innerHTML += `Uploading ${file.name} (${file.size} bytes)...<br>`;
-    const fd = new FormData();
-    fd.append('file', file);
-    try {
-      const res = await fetch('/upload', { method: 'POST', body: fd });
-      const text = await res.text();
-      status.innerHTML += `${file.name}: ${text}<br>`;
-    } catch (e) {
-      status.innerHTML += `${file.name}: FAILED — ${e}<br>`;
-    }
-  }
-}
-
-async function uploadFirmware() {
-  const file = document.getElementById('fwFile').files[0];
-  const status = document.getElementById('fwStatus');
-  if (!file) { status.textContent = 'Select a .bin file first'; return; }
-  status.textContent = `Uploading ${file.name} (${file.size} bytes)...`;
-  const formData = new FormData();
-  formData.append('firmware', file, file.name);
-  try {
-    const res = await fetch('/ota_upload', { method: 'POST', body: formData });
-    const text = await res.text();
-    status.textContent = res.ok ? 'Update OK — rebooting...' : ('Failed: ' + text);
-  } catch (e) {
-    status.textContent = 'Upload error (device likely rebooting): ' + e;
-  }
-}
 
 setInterval(()=>{
   fetch('/s').then(r=>r.json()).then(d=>{
