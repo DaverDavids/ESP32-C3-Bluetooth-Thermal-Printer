@@ -668,21 +668,29 @@ void handleTwitchIRC() {
 
 // ========== BLE CONNECTION ==========
 
+// bleDeinit() — full NimBLE stack teardown to recover leaked heap.
+// Must be called whenever a connect attempt fails or times out.
+// BLEDevice::init() is called fresh in connectPrinter() on the next attempt.
+static void bleDeinit() {
+  pClient = nullptr;
+  pWriteCharacteristic = nullptr;
+  BLEDevice::deinit(true);
+  logMsg("BLE stack deinit. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
+}
+
 class MyClientCallback : public BLEClientCallbacks {
   void onConnect(BLEClient* p) {
     logMsg("BLE onConnect fired");
-    // bleState advance is handled in the BLE_CONNECTING poll in loop()
-    // so we don't set BLE_DISCOVERING here — the poll detects isConnected()
   }
   void onDisconnect(BLEClient* p) {
     printerConnected = false;
+    pWriteCharacteristic = nullptr;
     bleState = BLE_IDLE;
     logMsg("BLE Disconnected — will retry in 15s");
   }
 };
 
-// connectPrinter() — non-blocking connect (false). Loop polls isConnected()
-// with a 15s timeout rather than blocking the entire loop() for 30s.
+// connectPrinter() — non-blocking connect (false). Loop polls isConnected().
 void connectPrinter() {
   if (ESP.getFreeHeap() < 45000 || ESP.getMaxAllocHeap() < 45000) {
     logMsg("BLE connect SKIPPED: heap too low (free=" + String(ESP.getFreeHeap()) +
@@ -998,9 +1006,6 @@ void setup() {
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
   logMsg("After ArduinoOTA. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
-  // connectTwitch() intentionally NOT called here.
-  // BLE connects first via loop(); Twitch connects once BLE_INITING completes.
-  // If BLE fails repeatedly, Twitch falls back after first BLE_FAILED.
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
   server.on("/gcfg",     handleGetConfig);
@@ -1088,8 +1093,8 @@ void loop() {
   static unsigned long lastHeapLog      = 0;
   static unsigned long lastPrinterRetry = 0;
   static unsigned long lastTwitchRetry  = 0;
-  static unsigned long connectStart     = 0;  // BLE_CONNECTING timeout tracker
-  static unsigned long discoverStart    = 0;  // BLE_DISCOVERING timeout tracker
+  static unsigned long connectStart     = 0;
+  static unsigned long discoverStart    = 0;
   unsigned long now = millis();
 
   if (now - lastHeapLog > 10000) {
@@ -1143,8 +1148,8 @@ void loop() {
         bleState = BLE_DISCOVERING;
         discoverStart = 0;
       } else if (now - connectStart > 15000) {
-        logMsg("BLE connect timeout — will retry in 15s");
-        pClient->disconnect();
+        logMsg("BLE connect timeout — deiniting stack");
+        bleDeinit();
         connectStart = 0;
         bleState = BLE_FAILED;
       }
@@ -1160,14 +1165,14 @@ void loop() {
           discoverStart = 0;
           bleState = BLE_INITING;
         } else {
-          logMsg("BLE char not found");
-          pClient->disconnect();
+          logMsg("BLE char not found — deiniting stack");
+          bleDeinit();
           discoverStart = 0;
           bleState = BLE_FAILED;
         }
       } else if (now - discoverStart > 10000) {
-        logMsg("BLE discover timeout");
-        pClient->disconnect();
+        logMsg("BLE discover timeout — deiniting stack");
+        bleDeinit();
         discoverStart = 0;
         bleState = BLE_FAILED;
       }
@@ -1183,7 +1188,6 @@ void loop() {
       logMsg("Printer Ready. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
       bleState = BLE_READY;
 
-      // First-ever Twitch connect: BLE heap is now settled, TLS gets a clean window.
       if (!twitchEverConnected) {
         logMsg("BLE ready — initiating first Twitch connect");
         connectTwitch();
@@ -1191,9 +1195,7 @@ void loop() {
       }
     }
 
-    // ---- BLE_FAILED: if Twitch never connected yet, connect it now as fallback ----
-    // This handles the case where the printer is off/out of range at boot
-    // but the stream is live. Twitch will start regardless after first failure.
+    // ---- BLE_FAILED: Twitch fallback + back to IDLE ----
     if (bleState == BLE_FAILED) {
       if (!twitchEverConnected) {
         logMsg("BLE failed — connecting Twitch as fallback");
