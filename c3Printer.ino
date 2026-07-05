@@ -434,6 +434,7 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
   unsigned long tStart = millis();
 
+  LittleFS.begin(false, "/littlefs", 4);
   text = processNewlines(text);
   if (printScale < 1) printScale = 1;
   if (printScale > 3) printScale = 3;
@@ -925,13 +926,13 @@ void setup() {
       logMsg("GlyphA NOT FOUND");
     if (df) df.close();
   }
-  LittleFS.end();
   logMsg("After VLW. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(MYSSID, MYPSK);
+  WiFi.setAutoReconnect(true);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   logMsg("\nWiFi OK: " + WiFi.localIP().toString());
 
