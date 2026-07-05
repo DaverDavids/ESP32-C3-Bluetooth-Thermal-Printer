@@ -825,6 +825,13 @@ void handleTestEvent() {
 void handleUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
+    // Tear down Twitch TLS — frees ~20KB of heap needed for LittleFS writes
+    if (twitchConnected || twitchClient.connected()) {
+      logMsg("Disconnecting Twitch before upload");
+      twitchClient.stop();
+      twitchConnected = false;
+      delay(100);
+    }
     if (printerConnected || bleState == BLE_CONNECTING || bleState == BLE_DISCOVERING) {
       logMsg("Disconnecting BLE before upload");
       disconnectPrinter(); delay(200);
