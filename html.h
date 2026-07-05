@@ -1,4 +1,7 @@
-const char* htmlPage = R"rawliteral(
+// htmlPage stored in PROGMEM (flash) — never loaded into heap.
+// Use server.send_P() to serve it directly from flash.
+// Saves ~11KB of contiguous RAM vs a plain const char* in RAM.
+const char htmlPage[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en"><head><title>C3 Printer</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -54,7 +57,7 @@ textarea{height:56px;resize:vertical;font-family:monospace}
 
 <div class="card">
   <h2>Manual Test Print</h2>
-  <textarea id="t_txt">Hello! Caf&#233; resum&#233; na&#239;ve &#1055;&#1088;&#1080;&#1074;&#1077;&#1090; &#12484; ¯\_(ツ)_/¯ 🤷</textarea>
+  <textarea id="t_txt">Hello! Caf&#233; resum&#233; na&#239;ve &#1055;&#1088;&#1080;&#1074;&#1077;&#1090; &#12484; &#9608;&#9617;&#9618; &#9484;&#9472;&#9488; &#9474; &#9492;&#9472;&#9496;</textarea>
   <div class="line-row" style="margin-top:6px">
     <div class="ctl size-ctl">
       <select id="t_s"></select>
@@ -73,8 +76,21 @@ textarea{height:56px;resize:vertical;font-family:monospace}
   </div>
 </div>
 
+<div class="card">
+  <h2>Upload Font Files</h2>
+  <form id="fontForm">
+    <input type="file" id="fontFiles" multiple accept=".vlw">
+    <button type="button" onclick="uploadFonts()" class="save">Upload to LittleFS</button>
+    <div id="uploadStatus" style="font-size:11px;margin-top:6px"></div>
+  </form>
+  <div style="margin-top:8px;font-size:12px;color:#9ca3af">
+    <a href="/fsinfo" target="_blank" style="color:#a78bfa">Filesystem info</a>
+    &nbsp;&middot;&nbsp;
+    <a href="/log" target="_blank" style="color:#a78bfa">Console log</a>
+  </div>
+</div>
+
 <script>
-// Size values are PRINT_SCALE multipliers: 1=Small(16px), 2=Medium(32px), 3=Large(48px)
 const SIZES = [
   [1,"Small"],[2,"Medium"],[3,"Large"]
 ];
@@ -143,7 +159,7 @@ function load() {
       }
     });
     el=document.getElementById('pts_filter'); if(el) el.value=d.pts_filter||'';
-  }).catch(()=>{});
+  }).catch(e=>console.warn('gcfg failed',e));
 }
 
 function save() {
@@ -189,6 +205,25 @@ function testPrint() {
 
 function feed()      { fetch('/f?lines=3'); }
 function doConnect() { fetch('/c').then(r=>r.text()).then(alert); }
+
+async function uploadFonts() {
+  const files = document.getElementById('fontFiles').files;
+  const status = document.getElementById('uploadStatus');
+  if (!files.length) { status.textContent = 'Select .vlw files first'; return; }
+  status.innerHTML = 'Tip: reboot device first if uploads keep failing.<br>';
+  for (const file of files) {
+    status.innerHTML += `Uploading ${file.name} (${file.size} bytes)...<br>`;
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: fd });
+      const text = await res.text();
+      status.innerHTML += `${file.name}: ${text}<br>`;
+    } catch (e) {
+      status.innerHTML += `${file.name}: FAILED — ${e}<br>`;
+    }
+  }
+}
 
 setInterval(()=>{
   fetch('/s').then(r=>r.json()).then(d=>{
