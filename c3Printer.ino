@@ -404,6 +404,9 @@ void feedPaper(int lines) {
 int drawGlyph(PrintCanvas& canvas, File& fontFile,
               const VlwGlyph* g, int x, int baseline_y, bool invert) {
   if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
+  logMsg("drawGlyph cp=" + String(g->cp) + " x=" + String(x) +
+         " baseline=" + String(baseline_y) + " yoff=" + String(g->y_off) +
+         " py0=" + String(baseline_y + g->y_off));
   int rowBytes = (g->w + 7) / 8;
   int bmpBytes = rowBytes * g->h;
   if (bmpBytes > MAX_GLYPH_BYTES) {
