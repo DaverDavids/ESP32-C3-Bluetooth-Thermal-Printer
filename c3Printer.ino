@@ -175,8 +175,9 @@ void initDefaults() {
 // ========== VLW LOADER ==========
 
 bool loadVlw(VlwFont& f, const char* path) {
+  LittleFS.begin(true, "/littlefs", 4);
   File file = LittleFS.open(path, "r");
-  if (!file) { logMsg("VLW missing: " + String(path)); return false; }
+  if (!file) { LittleFS.end(); logMsg("VLW missing: " + String(path)); return false; }
   auto read32 = [&]() -> int32_t {
     uint8_t b[4]; file.read(b, 4);
     return (int32_t)((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]);
@@ -187,6 +188,7 @@ bool loadVlw(VlwFont& f, const char* path) {
   read32(); read32(); read32();
   f.indexStart = file.position();
   file.close();
+  LittleFS.end();
   if (f.path) free(f.path);
   f.path   = strdup(path);
   f.loaded = true;
@@ -424,6 +426,8 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   if(text.length() == 0) { if(feedLines > 0) feedPaper(feedLines); return true; }
   unsigned long tStart = millis();
 
+  LittleFS.begin(false, "/littlefs", 4);
+
   text = processNewlines(text);
   if (printScale < 1) printScale = 1;
   if (printScale > 3) printScale = 3;
@@ -523,6 +527,7 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
 
   if (fBasicHandle) fBasicHandle.close();
   if (fCJKHandle)   fCJKHandle.close();
+  LittleFS.end();
   if(feedLines > 0) feedPaper(feedLines);
   unsigned long dt = millis() - tStart;
   if (dt > 1000) logMsg("printToThermal took " + String(dt) + " ms");
@@ -875,6 +880,7 @@ void handleUpload() {
     // Reload font metadata if a VLW was just uploaded
     if (upload.filename == "unifont_basic.vlw") loadVlw(fontBasic, "/unifont_basic.vlw");
     if (upload.filename == "unifont_cjk.vlw")   loadVlw(fontCJK,   "/unifont_cjk.vlw");
+    LittleFS.end();
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     logMsg("Upload ABORTED");
     uploadFailed = true; uploadInProgress = false;
@@ -899,14 +905,10 @@ void setup() {
   // maxOpenFiles=4: reduces LittleFS internal heap cost by ~2.4KB vs
   // the default of 10. We need at most 3 simultaneous file handles
   // (2 font files during render + 1 upload file), so 4 is safe.
-  if (!LittleFS.begin(true, "/littlefs", 4))
-    logMsg("LittleFS mount FAILED");
-  else
-    logMsg("LittleFS OK. total=" + String(LittleFS.totalBytes()) + " used=" + String(LittleFS.usedBytes()));
-
-  loadConfig();
+  LittleFS.begin(true, "/littlefs", 4);
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
+  LittleFS.end();
   logMsg("After VLW. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
 
   WiFi.mode(WIFI_STA);
@@ -931,6 +933,7 @@ void setup() {
   server.on("/test_evt", HTTP_POST, handleTestEvent);
   server.on("/upload",   HTTP_POST, handleUploadComplete, handleUpload);
   server.on("/fsinfo", []() {
+    LittleFS.begin(false, "/littlefs", 4);
     size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
     String out = "<h2>LittleFS Info</h2>";
     out += "<p>Total: "+String(total)+" used: "+String(used)+" free: "+String(total-used)+"</p><ul>";
@@ -944,13 +947,16 @@ void setup() {
     }
     if (!any) out += "<li>No files</li>";
     out += "</ul><p><a href=\"/\">&larr; Back</a></p>";
+    LittleFS.end();
     server.send(200, "text/html", out);
   });
   server.on("/delete_file", []() {
+    LittleFS.begin(false, "/littlefs", 4);
     String name = server.arg("name");
     if (!name.startsWith("/")) name = "/"+name;
-    if (!LittleFS.exists(name)) { server.send(404,"text/plain","Not found"); return; }
+    if (!LittleFS.exists(name)) { LittleFS.end(); server.send(404,"text/plain","Not found"); return; }
     LittleFS.remove(name);
+    LittleFS.end();
     server.send(200,"text/html","<p>Deleted: "+name+"</p><a href=\"/fsinfo\">&larr; Back</a>");
   });
   server.on("/console", []() {
