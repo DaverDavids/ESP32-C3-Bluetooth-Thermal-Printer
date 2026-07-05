@@ -35,9 +35,12 @@ BLERemoteCharacteristic* pWriteCharacteristic = nullptr;
 bool printerConnected = false;
 bool twitchConnected  = false;
 
-// twitchEverConnected: false until BLE reaches BLE_READY (or BLE fails and
-// we fall back). After that, Twitch reconnects independently of BLE state.
+// twitchEverConnected: set true once Twitch first connects.
+// After that, Twitch reconnects independently every 10s.
+// bleDeadlineMs: if BLE has not reached BLE_READY by this time,
+// Twitch connects anyway so a live stream with no printer still works.
 bool twitchEverConnected = false;
+unsigned long bleDeadlineMs = 0;  // set in setup() to millis() + 45000
 
 enum BLEConnState { BLE_IDLE, BLE_CONNECTING, BLE_DISCOVERING, BLE_INITING, BLE_READY, BLE_FAILED };
 volatile BLEConnState bleState = BLE_IDLE;
@@ -58,7 +61,7 @@ size_t logHead = 0;
 bool logWrapped = false;
 
 void logMsg(const char* msg) {
-  char line[LOG_BUF_SIZE > 160 ? 160 : LOG_BUF_SIZE];
+  char line[160];
   int len = snprintf(line, sizeof(line), "[%lu] %s\n", millis(), msg);
   if (len < 0) return;
   if ((size_t)len >= sizeof(line)) len = sizeof(line) - 1;
@@ -70,14 +73,12 @@ void logMsg(const char* msg) {
   Serial.print(line);
 }
 
-void logMsg(const String& msg) {
-  logMsg(msg.c_str());
-}
+void logMsg(const String& msg) { logMsg(msg.c_str()); }
 
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
-#define PRINT_SCALE 2
+#define PRINT_SCALE  2
 #define SCALE_SMALL  1
 #define SCALE_MEDIUM 2
 #define SCALE_LARGE  3
@@ -86,6 +87,9 @@ const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 static uint8_t glyphBuf[MAX_GLYPH_BYTES];
 
 // ========== VLW FONT STRUCTS ==========
+// bitmapOffsets[] has been REMOVED — it was malloc()ing 16-40KB of heap
+// permanently at boot, consuming the contiguous block that NimBLE and TLS
+// both need. Offsets are now computed on-the-fly via findGlyphOffset().
 
 struct VlwGlyph {
   uint32_t cp;
@@ -94,12 +98,12 @@ struct VlwGlyph {
 };
 
 struct VlwFont {
-  int       count;
-  int       size;
-  uint32_t  indexStart;
-  uint32_t* bitmapOffsets;
-  char*     path;
-  bool      loaded;
+  int      count;
+  int      size;          // point size from VLW header
+  uint32_t indexStart;    // file offset where glyph index begins
+  char*    path;
+  bool     loaded;
+  // NOTE: no bitmapOffsets[] array — zero heap cost at load time.
 };
 
 VlwFont fontBasic = {0};
@@ -180,6 +184,7 @@ void initDefaults() {
 }
 
 // ========== VLW LOADER ==========
+// Reads only the header and records indexStart. No heap allocation.
 
 bool loadVlw(VlwFont& f, const char* path) {
   File file = LittleFS.open(path, "r");
@@ -187,117 +192,80 @@ bool loadVlw(VlwFont& f, const char* path) {
 
   auto read32 = [&]() -> int32_t {
     uint8_t b[4]; file.read(b, 4);
-    return (b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+    return (int32_t)((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]);
   };
 
-  f.count  = read32();
-  int ver  = read32();
-  f.size   = read32();
-  read32(); read32(); read32();
+  f.count = read32();
+  /* ver */ read32();
+  f.size  = read32();
+  read32(); read32(); read32();   // reserved fields
 
-  f.indexStart = file.position();
-
-  f.bitmapOffsets = (uint32_t*)malloc(f.count * sizeof(uint32_t));
-  uint32_t bmpOff = f.indexStart + f.count * 24;
-  for (int i = 0; i < f.count; i++) {
-    if (f.bitmapOffsets) f.bitmapOffsets[i] = bmpOff;
-    read32();
-    int16_t h = (int16_t)read32();
-    int16_t w = (int16_t)read32();
-    read32(); read32(); read32();
-    int rowBytes = (w + 7) / 8;
-    bmpOff += rowBytes * h;
-  }
-
-  f.path = strdup(path);
+  f.indexStart = file.position(); // byte offset of first index entry
   file.close();
+
+  if (f.path) free(f.path);
+  f.path   = strdup(path);
   f.loaded = true;
-  logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs)");
+  logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs, 0 bytes heap)");
   return true;
 }
 
+// ========== GLYPH OFFSET CALCULATOR ==========
+// Walks the VLW index once to compute the bitmap offset for a given
+// index position. Each entry is 24 bytes; bitmap data follows all entries.
+// This replaces the old bitmapOffsets[] array that malloc'd 4 bytes per glyph.
+
+uint32_t findGlyphOffset(const VlwFont& f, File& file, int idx) {
+  // Scan entries 0..idx-1 accumulating bitmap bytes to find where entry
+  // idx's bitmap starts.
+  uint32_t bmpOff = f.indexStart + (uint32_t)f.count * 24;
+  for (int i = 0; i < idx; i++) {
+    file.seek(f.indexStart + i * 24 + 4); // skip cp(4), read h(4) w(4)
+    uint8_t b[8]; file.read(b, 8);
+    int16_t h = (int16_t)((b[0]<<8)|b[1]);
+    int16_t w = (int16_t)((b[4]<<8)|b[5]);
+    int rowBytes = (w + 7) / 8;
+    bmpOff += (uint32_t)rowBytes * (uint32_t)h;
+  }
+  return bmpOff;
+}
+
 // ========== GLYPH LOOKUP ==========
+// Binary-search the index for codepoint cp in an already-open file.
+// Calls findGlyphOffset() only for the matching entry — O(log n) seeks
+// for the binary search + O(n/2) linear scan for the offset.
+// For a 4000-glyph font that's ~12 seeks + ~2000 for the offset scan.
+// Acceptable for print-time; zero heap cost.
 
-const VlwGlyph* findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* out) {
-  if (!f.loaded || !f.bitmapOffsets) return nullptr;
+bool findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* out) {
+  if (!f.loaded || f.count == 0) return false;
 
-  auto read32 = [&]() -> int32_t {
+  auto read32at = [&](uint32_t pos) -> int32_t {
+    file.seek(pos);
     uint8_t b[4]; file.read(b, 4);
-    return (b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+    return (int32_t)((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]);
   };
 
   int lo = 0, hi = f.count - 1;
   while (lo <= hi) {
     int mid = (lo + hi) / 2;
-    file.seek(f.indexStart + mid * 24);
-    uint32_t midCp = (uint32_t)read32();
+    uint32_t midCp = (uint32_t)read32at(f.indexStart + mid * 24);
     if (midCp == cp) {
-      out->cp = midCp;
-      out->h  = (int16_t)read32();
-      out->w  = (int16_t)read32();
-      out->advance = (int16_t)read32();
-      out->x_off   = (int16_t)read32();
-      out->y_off   = (int16_t)read32();
-      out->bitmapOffset = f.bitmapOffsets[mid];
-      return out;
+      // Read remaining fields for this entry
+      file.seek(f.indexStart + mid * 24 + 4);
+      uint8_t b[20]; file.read(b, 20);
+      out->cp      = cp;
+      out->h       = (int16_t)((b[0]<<8)|b[1]);
+      out->w       = (int16_t)((b[4]<<8)|b[5]);
+      out->advance = (int16_t)((b[8]<<8)|b[9]);
+      out->x_off   = (int16_t)((b[12]<<8)|b[13]);
+      out->y_off   = (int16_t)((b[16]<<8)|b[17]);
+      out->bitmapOffset = findGlyphOffset(f, file, mid);
+      return true;
     } else if (midCp < cp) lo = mid + 1;
     else                   hi = mid - 1;
   }
-  return nullptr;
-}
-
-const VlwGlyph* getGlyph(uint32_t cp, const VlwFont** outFont) {
-  static VlwGlyph cacheBasic, cacheCJK;
-
-  if (fontBasic.loaded && fontBasic.bitmapOffsets) {
-    File fBasic = LittleFS.open(fontBasic.path, "r");
-    if (fBasic) {
-      if (findGlyphInOpenFile(fontBasic, fBasic, cp, &cacheBasic)) {
-        fBasic.close();
-        if (outFont) *outFont = &fontBasic;
-        return &cacheBasic;
-      }
-      fBasic.close();
-    }
-  }
-
-  if (fontCJK.loaded && fontCJK.bitmapOffsets) {
-    File fCJK = LittleFS.open(fontCJK.path, "r");
-    if (fCJK) {
-      if (findGlyphInOpenFile(fontCJK, fCJK, cp, &cacheCJK)) {
-        fCJK.close();
-        if (outFont) *outFont = &fontCJK;
-        return &cacheCJK;
-      }
-      fCJK.close();
-    }
-  }
-
-  if (outFont) *outFont = nullptr;
-  return nullptr;
-}
-
-int drawGlyph(PrintCanvas& canvas, const VlwFont& font, File& fontFile,
-              const VlwGlyph* g, int x, int baseline_y, bool invert) {
-  if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
-  int rowBytes = (g->w + 7) / 8;
-  int bmpBytes = rowBytes * g->h;
-  if (bmpBytes > MAX_GLYPH_BYTES) {
-    logMsg("WARN: glyph too large for glyphBuf, skipping");
-    return g->advance;
-  }
-  fontFile.seek(g->bitmapOffset);
-  fontFile.read(glyphBuf, bmpBytes);
-  for (int row = 0; row < g->h; row++) {
-    int py = baseline_y + g->y_off + row;
-    for (int col = 0; col < g->w; col++) {
-      int px = x + g->x_off + col;
-      uint8_t byte = glyphBuf[row * rowBytes + col / 8];
-      bool set = (byte >> (7 - (col % 8))) & 1;
-      if (set) canvas.drawPixel(px, py, invert ? 0 : 1);
-    }
-  }
-  return g->advance;
+  return false;
 }
 
 // ========== TEXT PROCESSING ==========
@@ -347,41 +315,61 @@ uint32_t nextCodepoint(const String& s, int& i) {
   unsigned char c = (unsigned char)s[i];
   if (c < 0x80)  { i++; return c; }
   if (c < 0xC0)  { i++; return 0xFFFD; }
-  if (c < 0xE0)  { uint32_t cp = (c & 0x1F); i++; if(i<(int)s.length()) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
-  if (c < 0xF0)  { uint32_t cp = (c & 0x0F); i++; for(int j=0;j<2&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
-  { uint32_t cp = (c & 0x07); i++; for(int j=0;j<3&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
+  if (c < 0xE0)  { uint32_t cp=(c&0x1F); i++; if(i<(int)s.length()) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
+  if (c < 0xF0)  { uint32_t cp=(c&0x0F); i++; for(int j=0;j<2&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
+  { uint32_t cp=(c&0x07); i++; for(int j=0;j<3&&i<(int)s.length();j++) cp=(cp<<6)|((unsigned char)s[i++]&0x3F); return cp; }
 }
 
-// ========== VLW WORD WRAP ==========
+// ========== VLW MEASURE / WORD-WRAP ==========
+// All variants accept pre-opened File& handles so callers that already
+// have the files open pay zero open/close overhead per character.
+// The no-handle overloads open/close once internally for convenience.
 
-int measureTextVlw(const String& text) {
+int measureTextVlwF(const String& text, File& fBasic, File& fCJK) {
   int total = 0, i = 0, len = (int)text.length();
+  VlwGlyph g;
   while (i < len) {
     uint32_t cp = nextCodepoint(text, i);
-    const VlwFont* srcFont = nullptr;
-    const VlwGlyph* g = getGlyph(cp, &srcFont);
-    if (g) total += g->advance;
-    else   total += fontBasic.size / 2;
+    if (fontBasic.loaded && findGlyphInOpenFile(fontBasic, fBasic, cp, &g)) {
+      total += g.advance;
+    } else if (fontCJK.loaded && findGlyphInOpenFile(fontCJK, fCJK, cp, &g)) {
+      total += g.advance;
+    } else {
+      total += fontBasic.size / 2;
+    }
   }
   return total;
 }
 
-String wordWrap(const String& text, int maxWidth) {
+int measureTextVlw(const String& text) {
+  File fB, fC;
+  if (fontBasic.loaded && fontBasic.path) fB = LittleFS.open(fontBasic.path, "r");
+  if (fontCJK.loaded   && fontCJK.path)   fC = LittleFS.open(fontCJK.path,   "r");
+  int w = measureTextVlwF(text, fB, fC);
+  if (fB) fB.close();
+  if (fC) fC.close();
+  return w;
+}
+
+String wordWrapF(const String& text, int maxWidth, File& fBasic, File& fCJK) {
   String result = "";
   int lineStart = 0, textLen = (int)text.length();
+  VlwGlyph g;
 
   while (lineStart < textLen) {
     int lineEnd = text.indexOf('\n', lineStart);
     if (lineEnd < 0) lineEnd = textLen;
 
-    int i = lineStart, lineWidth = 0, lastSpaceI = -1, lastSpaceW = 0;
+    int i = lineStart, lineWidth = 0, lastSpaceI = -1;
     while (i < lineEnd) {
-      if (text[i] == ' ') { lastSpaceI = i; lastSpaceW = lineWidth; }
+      if (text[i] == ' ') { lastSpaceI = i; }
       int before = i;
       uint32_t cp = nextCodepoint(text, i);
-      const VlwFont* sf = nullptr;
-      const VlwGlyph* g = getGlyph(cp, &sf);
-      int adv = g ? g->advance : (fontBasic.size / 2);
+      int adv;
+      if (fontBasic.loaded && findGlyphInOpenFile(fontBasic, fBasic, cp, &g))      adv = g.advance;
+      else if (fontCJK.loaded && findGlyphInOpenFile(fontCJK, fCJK, cp, &g))       adv = g.advance;
+      else                                                                           adv = fontBasic.size / 2;
+
       if (lineWidth + adv > maxWidth && lineWidth > 0) {
         int breakAt = (lastSpaceI > lineStart) ? lastSpaceI : before;
         result += text.substring(lineStart, breakAt);
@@ -401,6 +389,16 @@ String wordWrap(const String& text, int maxWidth) {
     lineStart = lineEnd + 1;
   }
   return result;
+}
+
+String wordWrap(const String& text, int maxWidth) {
+  File fB, fC;
+  if (fontBasic.loaded && fontBasic.path) fB = LittleFS.open(fontBasic.path, "r");
+  if (fontCJK.loaded   && fontCJK.path)   fC = LittleFS.open(fontCJK.path,   "r");
+  String r = wordWrapF(text, maxWidth, fB, fC);
+  if (fB) fB.close();
+  if (fC) fC.close();
+  return r;
 }
 
 // ========== BITMAP PRINTING ==========
@@ -435,6 +433,29 @@ void feedPaper(int lines) {
   }
 }
 
+int drawGlyph(PrintCanvas& canvas, File& fontFile,
+              const VlwGlyph* g, int x, int baseline_y, bool invert) {
+  if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
+  int rowBytes = (g->w + 7) / 8;
+  int bmpBytes = rowBytes * g->h;
+  if (bmpBytes > MAX_GLYPH_BYTES) {
+    logMsg("WARN: glyph too large for glyphBuf, skipping");
+    return g->advance;
+  }
+  fontFile.seek(g->bitmapOffset);
+  fontFile.read(glyphBuf, bmpBytes);
+  for (int row = 0; row < g->h; row++) {
+    int py = baseline_y + g->y_off + row;
+    for (int col = 0; col < g->w; col++) {
+      int px = x + g->x_off + col;
+      uint8_t byte = glyphBuf[row * rowBytes + col / 8];
+      bool set = (byte >> (7 - (col % 8))) & 1;
+      if (set) canvas.drawPixel(px, py, invert ? 0 : 1);
+    }
+  }
+  return g->advance;
+}
+
 // ========== THERMAL PRINT ==========
 
 bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool invert, int feedLines) {
@@ -443,7 +464,6 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   unsigned long tStart = millis();
 
   text = processNewlines(text);
-
   if (printScale < 1) printScale = 1;
   if (printScale > 3) printScale = 3;
 
@@ -454,17 +474,19 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   const int lineHeight  = vlwSize + lineSpacing;
   const int baseline    = vlwSize;
 
-  text = wordWrap(text, maxTextW);
+  // Open font files once for the entire render — shared by wordwrap,
+  // measure, and drawGlyph. Zero per-character open/close overhead.
+  File fBasicHandle, fCJKHandle;
+  if (fontBasic.loaded && fontBasic.path) fBasicHandle = LittleFS.open(fontBasic.path, "r");
+  if (fontCJK.loaded   && fontCJK.path)   fCJKHandle   = LittleFS.open(fontCJK.path,   "r");
+
+  text = wordWrapF(text, maxTextW, fBasicHandle, fCJKHandle);
 
   int totalLines = 1;
   for(int i = 0; i < (int)text.length(); i++) if(text[i] == '\n') totalLines++;
 
   int linesPerChunk = max(1, 200 / lineHeight);
   int currentLineIndex = 0, textIndex = 0;
-
-  File fBasicHandle, fCJKHandle;
-  if (fontBasic.loaded && fontBasic.path) fBasicHandle = LittleFS.open(fontBasic.path, "r");
-  if (fontCJK.loaded   && fontCJK.path)   fCJKHandle   = LittleFS.open(fontCJK.path,   "r");
 
   while(currentLineIndex < totalLines) {
     int chunkLineCount = 0, chunkHeight = 0;
@@ -487,7 +509,7 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
       String line = text.substring(textIndex, lineEnd);
 
       if(line.length() > 0) {
-        int tw = min(measureTextVlw(line), renderW - 4);
+        int tw = min(measureTextVlwF(line, fBasicHandle, fCJKHandle), renderW - 4);
 
         int x = 2;
         if     (align == 1) x = max(2, (renderW - tw) / 2);
@@ -497,23 +519,13 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
         while (ci < clen) {
           uint32_t cp = nextCodepoint(line, ci);
           VlwGlyph glyphOut;
-          const VlwGlyph* g = nullptr;
-          File* usedFile = nullptr;
 
-          if (fBasicHandle && fontBasic.loaded && fontBasic.bitmapOffsets) {
-            if (findGlyphInOpenFile(fontBasic, fBasicHandle, cp, &glyphOut)) {
-              g = &glyphOut; usedFile = &fBasicHandle;
-            }
-          }
-          if (!g && fCJKHandle && fontCJK.loaded && fontCJK.bitmapOffsets) {
-            if (findGlyphInOpenFile(fontCJK, fCJKHandle, cp, &glyphOut)) {
-              g = &glyphOut; usedFile = &fCJKHandle;
-            }
-          }
-
-          if (g && usedFile) {
-            x += drawGlyph(canvas, *usedFile == fBasicHandle ? fontBasic : fontCJK,
-                           *usedFile, g, x, drawY, invert);
+          if (fBasicHandle && fontBasic.loaded &&
+              findGlyphInOpenFile(fontBasic, fBasicHandle, cp, &glyphOut)) {
+            x += drawGlyph(canvas, fBasicHandle, &glyphOut, x, drawY, invert);
+          } else if (fCJKHandle && fontCJK.loaded &&
+              findGlyphInOpenFile(fontCJK, fCJKHandle, cp, &glyphOut)) {
+            x += drawGlyph(canvas, fCJKHandle, &glyphOut, x, drawY, invert);
           } else {
             x += vlwSize / 2;
           }
@@ -622,7 +634,7 @@ void parseTwitchMessage(String msg) {
 
 // connectTwitch() — called from loop() only, never from setup().
 void connectTwitch() {
-  if (ESP.getMaxAllocHeap() < 30000) {
+  if (ESP.getMaxAllocHeap() < 20000) {
     logMsg("Twitch connect SKIPPED: heap too low (maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
     twitchConnected = false;
     return;
@@ -634,9 +646,9 @@ void connectTwitch() {
     twitchClient.println("NICK " TWITCH_OAUTH_NICK);
     twitchClient.println("CAP REQ :twitch.tv/tags twitch.tv/commands");
     twitchClient.println("JOIN #" TWITCH_CHANNEL);
-    twitchConnected = true;
-    twitchEverConnected = true;
-    lastTwitchPing  = millis();
+    twitchConnected      = true;
+    twitchEverConnected  = true;
+    lastTwitchPing       = millis();
     logMsg("Twitch OK");
   } else {
     twitchConnected = false;
@@ -668,9 +680,6 @@ void handleTwitchIRC() {
 
 // ========== BLE CONNECTION ==========
 
-// bleDeinit() — full NimBLE stack teardown to recover leaked heap.
-// Must be called whenever a connect attempt fails or times out.
-// BLEDevice::init() is called fresh in connectPrinter() on the next attempt.
 static void bleDeinit() {
   pClient = nullptr;
   pWriteCharacteristic = nullptr;
@@ -690,9 +699,8 @@ class MyClientCallback : public BLEClientCallbacks {
   }
 };
 
-// connectPrinter() — non-blocking connect (false). Loop polls isConnected().
 void connectPrinter() {
-  if (ESP.getFreeHeap() < 45000 || ESP.getMaxAllocHeap() < 45000) {
+  if (ESP.getFreeHeap() < 35000 || ESP.getMaxAllocHeap() < 35000) {
     logMsg("BLE connect SKIPPED: heap too low (free=" + String(ESP.getFreeHeap()) +
            " maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
     return;
@@ -862,36 +870,27 @@ void handleTestEvent() {
 
 void handleFirmwareUpload() {
   HTTPUpload& upload = server.upload();
-
   if (upload.status == UPLOAD_FILE_START) {
     if (printerConnected || bleState == BLE_CONNECTING || bleState == BLE_DISCOVERING) {
       logMsg("Disconnecting BLE before firmware upload");
       disconnectPrinter();
       delay(200);
     }
-    logMsg("Firmware upload start: " + upload.filename + " free heap " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
+    logMsg("Firmware upload start: " + upload.filename + " free heap " + String(ESP.getFreeHeap()));
     if (ESP.getMaxAllocHeap() < 20000) {
-      logMsg("REJECTED firmware upload: MaxAlloc too low (" + String(ESP.getMaxAllocHeap()) + " bytes)");
+      logMsg("REJECTED firmware upload: MaxAlloc too low (" + String(ESP.getMaxAllocHeap()) + ")");
       return;
     }
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH))
       logMsg("Update.begin failed: " + String(Update.errorString()));
-    }
-  }
-  else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
       logMsg("Update.write failed: " + String(Update.errorString()));
-    }
-  }
-  else if (upload.status == UPLOAD_FILE_END) {
+  } else if (upload.status == UPLOAD_FILE_END) {
     lastUploadFinish = millis();
-    if (Update.end(true)) {
-      logMsg("Firmware update SUCCESS, total " + String(upload.totalSize) + " bytes, rebooting");
-    } else {
-      logMsg("Update.end failed: " + String(Update.errorString()));
-    }
-  }
-  else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (Update.end(true)) logMsg("Firmware update SUCCESS, " + String(upload.totalSize) + " bytes, rebooting");
+    else                  logMsg("Update.end failed: " + String(Update.errorString()));
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
     logMsg("Firmware upload ABORTED");
   }
@@ -901,7 +900,6 @@ void handleFirmwareUpload() {
 
 void handleUpload() {
   HTTPUpload& upload = server.upload();
-
   if (upload.status == UPLOAD_FILE_START) {
     if (printerConnected || bleState == BLE_CONNECTING || bleState == BLE_DISCOVERING) {
       logMsg("Disconnecting BLE before upload to free heap");
@@ -910,36 +908,26 @@ void handleUpload() {
     }
     logMsg("Free heap before upload: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
     if (ESP.getMaxAllocHeap() < 20000) {
-      logMsg("REJECTED upload: MaxAlloc too low (" + String(ESP.getMaxAllocHeap()) + " bytes) — reboot device first");
+      logMsg("REJECTED upload: MaxAlloc too low — reboot device first");
       uploadFailed = true;
       return;
     }
-
     String filename = "/" + upload.filename;
     logMsg("Upload start: " + filename);
-
     size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
-    logMsg("LittleFS free: " + String(freeBytes) + " bytes");
-
-    size_t expected = server.header("Content-Length").toInt();
+    size_t expected  = server.header("Content-Length").toInt();
     if (expected > 0 && expected > freeBytes) {
       logMsg("REJECTED: need " + String(expected) + " bytes, only " + String(freeBytes) + " free");
       uploadFailed = true;
       return;
     }
-
     if (LittleFS.exists(filename)) LittleFS.remove(filename);
     uploadFile = LittleFS.open(filename, "w");
     uploadWrittenBytes = 0;
-    uploadFailed = false;
-    uploadInProgress = true;
-
-    if (!uploadFile) {
-      logMsg("Failed to open file for writing");
-      uploadFailed = true;
-    }
-  }
-  else if (upload.status == UPLOAD_FILE_WRITE) {
+    uploadFailed       = false;
+    uploadInProgress   = true;
+    if (!uploadFile) { logMsg("Failed to open file for writing"); uploadFailed = true; }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (uploadFile && !uploadFailed) {
       size_t written = uploadFile.write(upload.buf, upload.currentSize);
       uploadWrittenBytes += written;
@@ -949,31 +937,25 @@ void handleUpload() {
       }
     }
     yield();
-  }
-  else if (upload.status == UPLOAD_FILE_END) {
+  } else if (upload.status == UPLOAD_FILE_END) {
     if (uploadFile) uploadFile.close();
     logMsg("Upload end: " + String(uploadWrittenBytes) + " bytes written");
     uploadInProgress = false;
     lastUploadFinish = millis();
-    if (uploadWrittenBytes == 0) {
-      uploadFailed = true;
-      logMsg("Upload wrote zero bytes");
-    }
-  }
-  else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (uploadWrittenBytes == 0) { uploadFailed = true; logMsg("Upload wrote zero bytes"); }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
     logMsg("Upload ABORTED by client");
-    uploadFailed = true;
+    uploadFailed     = true;
     uploadInProgress = false;
     if (uploadFile) uploadFile.close();
   }
 }
 
 void handleUploadComplete() {
-  if (uploadFailed) {
+  if (uploadFailed)
     server.send(500, "text/plain", "Upload FAILED — wrote " + String(uploadWrittenBytes) + " bytes");
-  } else {
+  else
     server.send(200, "text/plain", "Upload OK: " + String(uploadWrittenBytes) + " bytes written.");
-  }
 }
 
 // ========== SETUP & LOOP ==========
@@ -982,15 +964,13 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   logMsg("Boot. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
-  if (!LittleFS.begin(true)) {
+  if (!LittleFS.begin(true))
     logMsg("LittleFS mount failed even after format attempt");
-  } else {
+  else
     logMsg("LittleFS mounted OK");
-  }
   logMsg("LittleFS total: " + String(LittleFS.totalBytes()) + " used: " + String(LittleFS.usedBytes()));
-  logMsg("After LittleFS. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   loadConfig();
-  logMsg("After loadConfig. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
+  // loadVlw now allocates 0 heap — safe to call before WiFi/BLE init
   loadVlw(fontBasic, "/unifont_basic.vlw");
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
   logMsg("After VLW load. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
@@ -1000,12 +980,9 @@ void setup() {
   WiFi.begin(MYSSID, MYPSK);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   logMsg("\nWiFi OK: " + WiFi.localIP().toString());
-  logMsg("After WiFi connect. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS: http://c3printer.local"); }
-  logMsg("After mDNS. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
-  logMsg("After ArduinoOTA. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
   server.on("/",         handleRoot);
   server.on("/s",        handleStatus);
   server.on("/gcfg",     handleGetConfig);
@@ -1015,7 +992,7 @@ void setup() {
   server.on("/f",        handleFeed);
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
-  server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
+  server.on("/upload",   HTTP_POST, handleUploadComplete, handleUpload);
   server.on("/ota_upload", HTTP_POST,
     [](){
       server.sendHeader("Connection", "close");
@@ -1026,21 +1003,15 @@ void setup() {
     handleFirmwareUpload
   );
   server.on("/fsinfo", []() {
-    size_t total = LittleFS.totalBytes();
-    size_t used  = LittleFS.usedBytes();
-    size_t free  = total - used;
+    size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
     String out = "<h2>LittleFS Info</h2>";
-    out += "<p>Total: " + String(total) + " bytes<br>";
-    out += "Used: " + String(used) + " bytes<br>";
-    out += "Free: " + String(free) + " bytes</p>";
+    out += "<p>Total: "+String(total)+" bytes<br>Used: "+String(used)+" bytes<br>Free: "+String(total-used)+" bytes</p>";
     out += "<h3>Files</h3><ul>";
-    File root = LittleFS.open("/");
-    File f = root.openNextFile();
-    bool any = false;
+    File root = LittleFS.open("/"); File f = root.openNextFile(); bool any = false;
     while (f) {
       any = true;
       String name = String(f.name());
-      out += "<li>" + name + " - " + String(f.size()) + " bytes <a href=\"/delete_file?name=" + name + "\" onclick=\"return confirm('Delete " + name + "?')\" style=\"color:#f87171\">[delete]</a></li>";
+      out += "<li>"+name+" - "+String(f.size())+" bytes <a href=\"/delete_file?name="+name+"\" onclick=\"return confirm('Delete "+name+"?')\" style=\"color:#f87171\">[delete]</a></li>";
       f = root.openNextFile();
     }
     if (!any) out += "<li>No files</li>";
@@ -1049,44 +1020,36 @@ void setup() {
   });
   server.on("/delete_file", []() {
     String name = server.arg("name");
-    if (name.length() == 0) { server.send(400, "text/plain", "Missing name"); return; }
-    if (!name.startsWith("/")) name = "/" + name;
-    if (!LittleFS.exists(name)) { server.send(404, "text/plain", "Not found: " + name); return; }
+    if (name.length() == 0) { server.send(400,"text/plain","Missing name"); return; }
+    if (!name.startsWith("/")) name = "/"+name;
+    if (!LittleFS.exists(name)) { server.send(404,"text/plain","Not found: "+name); return; }
     LittleFS.remove(name);
-    server.send(200, "text/html", "<p>Deleted: " + name + "</p><p><a href=\"/fsinfo\" style=\"color:#a78bfa\">&larr; Back</a></p>");
+    server.send(200,"text/html","<p>Deleted: "+name+"</p><p><a href=\"/fsinfo\" style=\"color:#a78bfa\">&larr; Back</a></p>");
   });
   server.on("/console", []() {
     String out;
-    if (logWrapped) {
-      out += String(logBuffer).substring(logHead);
-      out += String(logBuffer).substring(0, logHead);
-    } else {
-      out = String(logBuffer).substring(0, logHead);
-    }
+    if (logWrapped) { out += String(logBuffer).substring(logHead); out += String(logBuffer).substring(0, logHead); }
+    else            { out  = String(logBuffer).substring(0, logHead); }
     server.send(200, "text/plain", out);
   });
-  server.on("/ping", []() {
-    server.send(200, "text/plain", "pong");
-  });
+  server.on("/ping", []() { server.send(200,"text/plain","pong"); });
   server.on("/log", []() {
     server.send(200, "text/html", R"rawliteral(
 <!DOCTYPE html><html><head><title>Console</title>
 <style>body{background:#0f0f23;color:#4ade80;font-family:monospace;font-size:12px;padding:10px;white-space:pre-wrap}</style>
-</head><body>
-<div id="log">Loading...</div>
+</head><body><div id="log">Loading...</div>
 <script>
-async function tick(){
-  const r = await fetch('/console');
-  document.getElementById('log').textContent = await r.text();
-  window.scrollTo(0, document.body.scrollHeight);
-}
-setInterval(tick, 1000);
-tick();
-</script></body></html>
-)rawliteral");
+async function tick(){const r=await fetch('/console');document.getElementById('log').textContent=await r.text();window.scrollTo(0,document.body.scrollHeight);}
+setInterval(tick,1000);tick();
+</script></body></html>)rawliteral");
   });
   server.begin();
-  logMsg("Ready! BLE will connect first, Twitch after.");
+
+  // bleDeadlineMs: Twitch will connect unconditionally at this time
+  // even if BLE has not reached BLE_READY yet. Prevents Twitch being
+  // permanently blocked by a slow or absent printer.
+  bleDeadlineMs = millis() + 45000;
+  logMsg("Ready! BLE will connect first; Twitch fallback in 45s if BLE stalls.");
 }
 
 void loop() {
@@ -1101,7 +1064,7 @@ void loop() {
     lastHeapLog = now;
     char hb[128];
     snprintf(hb, sizeof(hb), "Uptime %lus  Free heap: %u MaxAlloc: %u RSSI %ddBm bleState: %d twitch: %d",
-             now / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), WiFi.RSSI(), (int)bleState, (int)twitchConnected);
+             now/1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), WiFi.RSSI(), (int)bleState, (int)twitchConnected);
     logMsg(hb);
   }
 
@@ -1119,13 +1082,19 @@ void loop() {
 
   if (!uploadInProgress) {
 
-    // ---- Twitch IRC keep-alive ----
+    // ---- Twitch IRC keep-alive / connect ----
     if (twitchConnected) {
       unsigned long t0 = micros();
       handleTwitchIRC();
       unsigned long dt = micros() - t0;
       if (dt > 50000) logMsg("WARN: handleTwitchIRC took " + String(dt) + " us");
     } else if (twitchEverConnected && now - lastTwitchRetry > 10000) {
+      // Normal reconnect path after first successful connect
+      lastTwitchRetry = now;
+      connectTwitch();
+    } else if (!twitchEverConnected && now >= bleDeadlineMs && now - lastTwitchRetry > 10000) {
+      // BLE deadline expired — connect Twitch regardless of BLE state
+      logMsg("BLE deadline reached — connecting Twitch unconditionally");
       lastTwitchRetry = now;
       connectTwitch();
     }
@@ -1155,7 +1124,7 @@ void loop() {
       }
     }
 
-    // ---- BLE_DISCOVERING: service/characteristic discovery with 10s timeout ----
+    // ---- BLE_DISCOVERING: service/char discovery with 10s timeout ----
     if (bleState == BLE_DISCOVERING && pClient) {
       if (discoverStart == 0) discoverStart = now;
       BLERemoteService* svc = pClient->getService(serviceUUID);
@@ -1166,15 +1135,11 @@ void loop() {
           bleState = BLE_INITING;
         } else {
           logMsg("BLE char not found — deiniting stack");
-          bleDeinit();
-          discoverStart = 0;
-          bleState = BLE_FAILED;
+          bleDeinit(); discoverStart = 0; bleState = BLE_FAILED;
         }
       } else if (now - discoverStart > 10000) {
         logMsg("BLE discover timeout — deiniting stack");
-        bleDeinit();
-        discoverStart = 0;
-        bleState = BLE_FAILED;
+        bleDeinit(); discoverStart = 0; bleState = BLE_FAILED;
       }
     }
 
@@ -1188,6 +1153,7 @@ void loop() {
       logMsg("Printer Ready. Heap: " + String(ESP.getFreeHeap()) + " MaxAlloc: " + String(ESP.getMaxAllocHeap()));
       bleState = BLE_READY;
 
+      // First Twitch connect on BLE success (before deadline)
       if (!twitchEverConnected) {
         logMsg("BLE ready — initiating first Twitch connect");
         connectTwitch();
