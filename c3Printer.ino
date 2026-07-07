@@ -32,6 +32,31 @@ unsigned long lastTwitchPing = 0;
 String pointsRewardFilter = "";
 bool shouldSaveConfig = false;
 
+// LOG_BUF_SIZE: 2KB ring buffer for console logs — no LittleFS writes.
+#define LOG_BUF_SIZE 2048
+char logBuffer[LOG_BUF_SIZE];
+size_t logHead = 0;
+bool logWrapped = false;
+
+void logMsg(const char* msg) {
+  char line[160];
+  int len = snprintf(line, sizeof(line), "[%lu] %s\n", millis(), msg);
+  if (len < 0) return;
+  if ((size_t)len >= sizeof(line)) len = sizeof(line) - 1;
+  for (int i = 0; i < len; i++) {
+    logBuffer[logHead] = line[i];
+    logHead = (logHead + 1) % LOG_BUF_SIZE;
+    if (logHead == 0) logWrapped = true;
+  }
+  Serial.print(line);
+}
+void logMsg(const String& msg) { logMsg(msg.c_str()); }
+
+int wifiReconnectCount = 0;
+uint8_t lastDisconnectReason = 0;
+unsigned long lastDisconnectTime = 0;
+unsigned long minFreeHeapSeen = 999999;
+
 const int PRINTER_WIDTH       = 400;
 const int PRINTER_WIDTH_BYTES = PRINTER_WIDTH / 8;
 
@@ -403,7 +428,7 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
     if(currentLineIndex + chunkLineCount >= totalLines) chunkHeight += lineSpacing * 2;
 
     PrintCanvas canvas(renderW, chunkHeight);
-    if(!canvas.buffer) { Serial.println("Chunk alloc failed!"); return false; }
+    if(!canvas.buffer) { logMsg("Chunk alloc failed!"); return false; }
 
     if(invert) canvas.fillRect(0, 0, renderW, chunkHeight, 1);
 
@@ -488,7 +513,7 @@ bool printToThermal(String text, uint8_t sizeId, int align, bool bold, bool inve
 
 void printEvent(EventConfig& cfg, String username, String val1, String val2) {
   if(!cfg.enabled) return;
-  Serial.println("Printing Event...");
+  logMsg("Printing Event...");
   for(int i = 0; i < 3; i++) {
     if(cfg.msg[i].length() == 0) continue;
     String p = cfg.msg[i];
@@ -543,7 +568,7 @@ void parseTwitchMessage(String msg) {
 }
 
 void connectTwitch() {
-  Serial.println("Connecting to Twitch IRC...");
+  logMsg("Connecting to Twitch IRC...");
   twitchClient.setInsecure();
   if(twitchClient.connect("irc.chat.twitch.tv", 6697)) {
     twitchClient.println("PASS " TWITCH_OAUTH_SECRET);
@@ -552,10 +577,10 @@ void connectTwitch() {
     twitchClient.println("JOIN #" TWITCH_CHANNEL);
     twitchConnected = true;
     lastTwitchPing  = millis();
-    Serial.println("Twitch OK");
+    logMsg("Twitch OK");
   } else {
     twitchConnected = false;
-    Serial.println("Twitch failed");
+    logMsg("Twitch failed");
   }
 }
 
@@ -577,19 +602,19 @@ void handleTwitchIRC() {
   }
   if(!twitchClient.connected()) {
     twitchConnected = false;
-    Serial.println("Twitch connection lost");
+    logMsg("Twitch connection lost");
   }
 }
 
 // ========== BLE CONNECTION ==========
 
 class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* p)    { Serial.println("BLE Connected"); }
-  void onDisconnect(BLEClient* p) { printerConnected = false; Serial.println("BLE Disconnected"); }
+  void onConnect(BLEClient* p)    { logMsg("BLE Connected"); }
+  void onDisconnect(BLEClient* p) { printerConnected = false; logMsg("BLE Disconnected"); }
 };
 
 bool connectPrinter() {
-  Serial.println("Connecting: " + printerMAC);
+  logMsg("Connecting: " + printerMAC);
   BLEDevice::init("ESP32-C3-Printer");
   if(pClient) delete pClient;
   pClient = BLEDevice::createClient();
@@ -605,7 +630,7 @@ bool connectPrinter() {
   pWriteCharacteristic->writeValue(wake, 5); delay(100);
   uint8_t init[] = {0x1B, 0x40};
   pWriteCharacteristic->writeValue(init, 2); delay(100);
-  Serial.println("Printer Ready");
+  logMsg("Printer Ready");
   return true;
 }
 
@@ -637,7 +662,7 @@ void loadConfig() {
   loadEvent("raid", twitchCfg.raids);
   pointsRewardFilter = preferences.getString("pts_filter", "");
   preferences.end();
-  Serial.println("Config loaded");
+  logMsg("Config loaded");
 }
 
 void saveConfig() {
@@ -662,7 +687,7 @@ void saveConfig() {
   saveEvent("raid", twitchCfg.raids);
   preferences.putString("pts_filter", pointsRewardFilter);
   preferences.end();
-  Serial.println("Config saved");
+  logMsg("Config saved");
 }
 
 // ========== WEB SERVER ==========
@@ -740,6 +765,10 @@ textarea{height:56px;resize:vertical;font-family:monospace}
     <button class="print-btn" onclick="testPrint()">&#128424; Print</button>
     <button class="feed-btn" onclick="feed()">&#128196; Feed 3</button>
   </div>
+</div>
+
+<div style="text-align:center;margin-top:10px;font-size:12px;color:#9ca3af">
+  <a href="/log" target="_blank" style="color:#a78bfa">Console log</a>
 </div>
 
 <script>
@@ -971,15 +1000,23 @@ void handleTestEvent() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\nESP32-C3 Thermal Printer (Unicode Fallback Mode)");
+  logMsg("ESP32-C3 Thermal Printer (Unicode Fallback Mode)");
   loadConfig();
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(MYSSID, MYPSK);
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      lastDisconnectReason = info.wifi_sta_disconnected.reason;
+      lastDisconnectTime = millis();
+      wifiReconnectCount++;
+    }
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
-  if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); Serial.println("mDNS: http://c3printer.local"); }
+  logMsg("WiFi OK: " + WiFi.localIP().toString());
+  if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS: http://c3printer.local"); }
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
   connectTwitch();
@@ -992,16 +1029,45 @@ void setup() {
   server.on("/f",        handleFeed);
   server.on("/tcfg",     HTTP_POST, handleTwitchConfig);
   server.on("/test_evt", HTTP_POST, handleTestEvent);
+  server.on("/console", []() {
+    String out;
+    if (logWrapped) { out = String(logBuffer + logHead) + String(logBuffer, logHead); }
+    else            { out = String(logBuffer, logHead); }
+    server.send(200, "text/plain", out);
+  });
+  server.on("/log", []() {
+    server.send_P(200, "text/html", R"rawliteral(
+<!DOCTYPE html><html><head><title>Console</title>
+<style>body{background:#0f0f23;color:#4ade80;font-family:monospace;font-size:12px;padding:10px;white-space:pre-wrap}</style>
+</head><body><div id="l">Loading...</div>
+<script>async function t(){const r=await fetch('/console');document.getElementById('l').textContent=await r.text();scrollTo(0,document.body.scrollHeight);}setInterval(t,1000);t();</script>
+</body></html>)rawliteral");
+  });
   server.begin();
-  Serial.println("Ready!");
+  logMsg("Ready!");
 }
 
 void loop() {
+  static unsigned long lastTwitchRetry = 0, lastPrinterRetry = 0, lastHeartbeat = 0;
+  unsigned long now = millis();
+
+  {
+    unsigned long f = ESP.getFreeHeap();
+    if (f < minFreeHeapSeen) minFreeHeapSeen = f;
+  }
+
+  if (now - lastHeartbeat > 10000) {
+    lastHeartbeat = now;
+    char hb[128];
+    snprintf(hb, sizeof(hb), "Uptime %lus free=%u maxAlloc=%u minFree=%u RSSI=%d",
+             now/1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+             (unsigned int)minFreeHeapSeen, WiFi.RSSI());
+    logMsg(hb);
+  }
+
   ArduinoOTA.handle();
   if(shouldSaveConfig) { saveConfig(); shouldSaveConfig = false; }
   server.handleClient();
-  static unsigned long lastTwitchRetry = 0, lastPrinterRetry = 0;
-  unsigned long now = millis();
   if(twitchConnected)   handleTwitchIRC();
   else if(now - lastTwitchRetry  > 10000) { lastTwitchRetry  = now; connectTwitch();   }
   if(!printerConnected && now - lastPrinterRetry > 15000) { lastPrinterRetry = now; connectPrinter(); }
