@@ -11,6 +11,9 @@
 #include <U8g2_for_Adafruit_GFX.h>
 #include <Secrets.h>
 
+struct SizeEntry;
+struct EventConfig;
+
 const char* hostname = "c3printer";
 #define TWITCH_CHANNEL "daverdavid"
 
@@ -577,7 +580,7 @@ void connectTwitch() {
     twitchClient.println("JOIN #" TWITCH_CHANNEL);
     twitchConnected = true;
     lastTwitchPing  = millis();
-    logMsg("Twitch OK");
+    logMsg("Twitch OK. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   } else {
     twitchConnected = false;
     logMsg("Twitch failed");
@@ -630,7 +633,7 @@ bool connectPrinter() {
   pWriteCharacteristic->writeValue(wake, 5); delay(100);
   uint8_t init[] = {0x1B, 0x40};
   pWriteCharacteristic->writeValue(init, 2); delay(100);
-  logMsg("Printer Ready");
+  logMsg("Printer Ready. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   return true;
 }
 
@@ -662,7 +665,7 @@ void loadConfig() {
   loadEvent("raid", twitchCfg.raids);
   pointsRewardFilter = preferences.getString("pts_filter", "");
   preferences.end();
-  logMsg("Config loaded");
+  logMsg("Config loaded. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
 }
 
 void saveConfig() {
@@ -1015,7 +1018,7 @@ void setup() {
     }
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  logMsg("WiFi OK: " + WiFi.localIP().toString());
+  logMsg("WiFi OK. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS: http://c3printer.local"); }
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
@@ -1044,7 +1047,7 @@ void setup() {
 </body></html>)rawliteral");
   });
   server.begin();
-  logMsg("Ready!");
+  logMsg("Ready! free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
 }
 
 void loop() {
