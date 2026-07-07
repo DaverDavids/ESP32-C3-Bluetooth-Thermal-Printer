@@ -452,8 +452,15 @@ bool printToThermal(String text, uint8_t printScale, int align, bool bold, bool 
   const int baseline    = vlwSize;
 
   File fBasicHandle, fCJKHandle;
-  if (fontBasic.loaded && fontBasic.path) fBasicHandle = LittleFS.open(fontBasic.path, "r");
-  if (fontCJK.loaded   && fontCJK.path)   fCJKHandle   = LittleFS.open(fontCJK.path,   "r");
+  if (fontBasic.loaded && fontBasic.path) {
+    logMsg("pre-open free=" + String(ESP.getFreeHeap()));
+    fBasicHandle = LittleFS.open(fontBasic.path, "r");
+    logMsg("post-open basic free=" + String(ESP.getFreeHeap()) + " handle=" + (fBasicHandle ? "ok" : "fail"));
+  }
+  if (fontCJK.loaded   && fontCJK.path) {
+    fCJKHandle = LittleFS.open(fontCJK.path, "r");
+    logMsg("post-open cjk free=" + String(ESP.getFreeHeap()) + " handle=" + (fCJKHandle ? "ok" : "fail"));
+  }
 
   text = wordWrapF(text, maxTextW, fBasicHandle, fCJKHandle);
 
@@ -1247,8 +1254,10 @@ void handleUpload() {
   if (upload.status == UPLOAD_FILE_START) {
     // Tear down Twitch TLS — frees ~20KB of heap needed for LittleFS writes
     if (twitchConnected || twitchClient.connected()) {
-      logMsg("Disconnecting Twitch before upload");
+      logMsg("Disconnecting Twitch before upload  pre-stop free=" + String(ESP.getFreeHeap()));
       twitchClient.stop();
+      delay(10);
+      logMsg("post-stop free=" + String(ESP.getFreeHeap()));
       twitchConnected = false;
       delay(100);
     }
@@ -1350,9 +1359,8 @@ void setup() {
     }
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  logMsg("\nWiFi OK: " + WiFi.localIP().toString());
-
-  if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS OK"); }
+  logMsg("WiFi OK. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
+  if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS OK. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap())); }
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA.begin();
 
