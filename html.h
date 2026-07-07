@@ -87,6 +87,8 @@ textarea{height:56px;resize:vertical;font-family:monospace}
     <a href="/fsinfo" target="_blank" style="color:#a78bfa">Filesystem info</a>
     &nbsp;&middot;&nbsp;
     <a href="/log" target="_blank" style="color:#a78bfa">Console log</a>
+    &nbsp;&middot;&nbsp;
+    <a href="/debug" target="_blank" style="color:#f87171">Debug</a>
   </div>
 </div>
 

@@ -49,6 +49,11 @@ bool uploadFailed = false;
 bool uploadInProgress = false;
 unsigned long lastUploadFinish = 0;
 
+int wifiReconnectCount = 0;
+uint8_t lastDisconnectReason = 0;
+unsigned long lastDisconnectTime = 0;
+unsigned long minFreeHeapSeen = 999999;
+
 // LOG_BUF_SIZE reduced from 8192 to 2048 — saves 6KB of static RAM.
 // The ring buffer is only consumed via /console; 2KB holds ~15-20 recent
 // log lines which is sufficient for debugging.
@@ -373,7 +378,8 @@ void sendCmd(const uint8_t* cmd, size_t len) {
   delay(10);
 }
 
-void printBitmap(uint8_t *bitmap, int width, int height) {
+void printBitmap(uint8_t *bitmap, int width, int height,
+                 int chunkSize = 200, int delayMs = 10) {
   if(!printerConnected || !bitmap) return;
   int widthBytes = width / 8;
   int totalData  = widthBytes * height;
@@ -385,11 +391,10 @@ void printBitmap(uint8_t *bitmap, int width, int height) {
   packet[6] = (uint8_t)(height & 0xFF);
   packet[7] = (uint8_t)(height >> 8);
   memcpy(packet + 8, bitmap, totalData);
-  int chunkSize = 200;
   for(int i = 0; i < 8 + totalData; i += chunkSize) {
     int sz = min(chunkSize, 8 + totalData - i);
     pWriteCharacteristic->writeValue(&packet[i], sz);
-    delay(10);
+    delay(delayMs);
   }
   free(packet);
 }
@@ -836,6 +841,405 @@ void handleTestEvent() {
   server.send(200,"text/plain","Test Sent");
 }
 
+// ========== DEBUG HANDLERS ==========
+
+void handleDbgRaw() {
+  if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
+  String pattern = server.arg("pattern");
+  int w = server.arg("w").toInt();
+  int h = server.arg("h").toInt();
+  if (w < 1 || h < 1) { server.send(400,"text/plain","Invalid w/h"); return; }
+  int wb = (w + 7) / 8;
+  uint8_t* bmp = (uint8_t*)malloc(wb * h);
+  if(!bmp) { server.send(500,"text/plain","malloc failed"); return; }
+  if (pattern == "checker") {
+    for (int y=0; y<h; y++) for (int x=0; x<w; x++)
+      if ((x/8 + y/8) % 2 == 0) bmp[y*wb + x/8] |= (1 << (7 - x%8));
+  } else if (pattern == "solid") {
+    memset(bmp, 0xFF, wb * h);
+  } else {
+    for (int i=0; i<wb*h; i++) bmp[i] = 0xAA;
+  }
+  printBitmap(bmp, w, h);
+  free(bmp);
+  feedPaper(3);
+  logMsg("dbg_raw: pattern=" + pattern + " w=" + String(w) + " h=" + String(h));
+  server.send(200,"text/plain","OK");
+}
+
+void handleDbgGlyph() {
+  if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
+  uint32_t cp = (uint32_t)server.arg("cp").toInt();
+  if (cp == 0) cp = 65;
+  File f;
+  VlwFont* fp = nullptr;
+  if (fontBasic.loaded && fontBasic.path) { f = LittleFS.open(fontBasic.path, "r"); fp = &fontBasic; }
+  if (!f && fontCJK.loaded && fontCJK.path) { f = LittleFS.open(fontCJK.path, "r"); fp = &fontCJK; }
+  if (!f) { server.send(400,"text/plain","No font file"); return; }
+  VlwGlyph g;
+  String res;
+  if (findGlyphInOpenFile(*fp, f, cp, &g)) {
+    int w = 20 + g.w + g.x_off;
+    int h = 5 + fp->size + 8;
+    PrintCanvas canvas(w, h);
+    if(!canvas.buffer) { res = "Canvas alloc failed"; }
+    else {
+      int bl = 5 + fp->size;
+      drawGlyph(canvas, f, &g, 10, bl, false);
+      int wb = (w + 7) / 8;
+      printBitmap(canvas.buffer, w, h);
+      res = "cp=" + String(g.cp) + " w=" + String(g.w) + " h=" + String(g.h) +
+            " adv=" + String(g.advance) + " x_off=" + String(g.x_off) +
+            " y_off=" + String(g.y_off) + " bitmapOffset=" + String(g.bitmapOffset);
+    }
+  } else {
+    res = "Glyph not found for cp=" + String(cp);
+  }
+  f.close();
+  feedPaper(3);
+  logMsg("dbg_glyph: " + res);
+  server.send(200,"text/plain", res);
+}
+
+void handleDbgLine() {
+  if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
+  String text = server.arg("text");
+  int scale = server.arg("scale").toInt();
+  if (scale < 1) scale = 1;
+  if (scale > 3) scale = 3;
+  unsigned long t0 = millis();
+  text = processNewlines(text);
+  const int vlwSize = (fontBasic.loaded ? fontBasic.size : 16);
+  const int renderW = PRINTER_WIDTH / scale;
+  const int maxTextW = renderW - 8;
+  const int lineSpacing = 3;
+  const int descender = 8;
+  const int lineHeight = vlwSize + lineSpacing + descender;
+  const int baseline = vlwSize;
+  File fBasicHandle, fCJKHandle;
+  if (fontBasic.loaded && fontBasic.path) fBasicHandle = LittleFS.open(fontBasic.path, "r");
+  if (fontCJK.loaded && fontCJK.path) fCJKHandle = LittleFS.open(fontCJK.path, "r");
+  String wrapped = wordWrapF(text, maxTextW, fBasicHandle, fCJKHandle);
+  unsigned long t1 = millis();
+  int totalLines = 1;
+  for(int i=0;i<(int)wrapped.length();i++) if(wrapped[i]=='\n') totalLines++;
+  int chunkHeight = lineHeight * totalLines + lineSpacing * 4;
+  PrintCanvas canvas(renderW, chunkHeight);
+  unsigned long t2 = millis();
+  if(!canvas.buffer) { server.send(500,"text/plain","Canvas alloc failed"); return; }
+  int drawY = lineSpacing + baseline;
+  int textIndex = 0;
+  for(int line=0; line<totalLines; line++) {
+    int lineEnd = wrapped.indexOf('\n', textIndex);
+    if(lineEnd < 0) lineEnd = (int)wrapped.length();
+    String line = wrapped.substring(textIndex, lineEnd);
+    if(line.length() > 0) {
+      int tw = min(measureTextVlwF(line, fBasicHandle, fCJKHandle), renderW - 4);
+      int x = max(2, (renderW - tw) / 2);
+      int ci = 0, clen = (int)line.length();
+      while (ci < clen) {
+        uint32_t cp = nextCodepoint(line, ci);
+        VlwGlyph glyphOut;
+        if (fBasicHandle && fontBasic.loaded &&
+            findGlyphInOpenFile(fontBasic, fBasicHandle, cp, &glyphOut))
+          x += drawGlyph(canvas, fBasicHandle, &glyphOut, x, drawY, false);
+        else if (fCJKHandle && fontCJK.loaded &&
+            findGlyphInOpenFile(fontCJK, fCJKHandle, cp, &glyphOut))
+          x += drawGlyph(canvas, fCJKHandle, &glyphOut, x, drawY, false);
+        else
+          x += vlwSize / 2;
+        if (x >= renderW - 2) break;
+      }
+    }
+    drawY += lineHeight;
+    textIndex = lineEnd + 1;
+  }
+  unsigned long t3 = millis();
+  int scaledH = chunkHeight * scale;
+  int scaledWBytes = PRINTER_WIDTH / 8;
+  int renderWBytes = renderW / 8;
+  uint8_t* scaled = (uint8_t*)malloc(scaledWBytes * scaledH);
+  unsigned long t4 = millis();
+  if (scaled) {
+    memset(scaled, 0, scaledWBytes * scaledH);
+    for (int row=0; row<chunkHeight; row++) {
+      const uint8_t* srcRow = canvas.buffer + row * renderWBytes;
+      for (int rep=0; rep<scale; rep++) {
+        uint8_t* dstRow = scaled + (row*scale + rep) * scaledWBytes;
+        for (int dstBit=0; dstBit<PRINTER_WIDTH; dstBit++) {
+          int srcBit = dstBit / scale;
+          if (srcBit < renderW) {
+            int sb = srcBit / 8, sbit = 7 - (srcBit % 8);
+            if (srcRow[sb] & (1 << sbit))
+              dstRow[dstBit / 8] |= (1 << (7 - (dstBit % 8)));
+          }
+        }
+      }
+    }
+    printBitmap(scaled, PRINTER_WIDTH, scaledH);
+    free(scaled);
+  }
+  unsigned long t5 = millis();
+  if (fBasicHandle) fBasicHandle.close();
+  if (fCJKHandle) fCJKHandle.close();
+  feedPaper(3);
+  char logline[200];
+  snprintf(logline, sizeof(logline),
+    "dbg_line: wrap=%lums canvas=%lums render=%lums scale=%lums print=%lums heap=%u maxAlloc=%u",
+    t1-t0, t2-t1, t3-t2, t4-t3, t5-t4, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  logMsg(logline);
+  server.send(200,"text/plain",logline);
+}
+
+void handleDbgChunk() {
+  if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
+  int bytes = server.arg("bytes").toInt();
+  int delayMs = server.arg("delayms").toInt();
+  if (bytes < 32) bytes = 200;
+  if (delayMs < 0) delayMs = 10;
+  int h = 64;
+  int wb = PRINTER_WIDTH / 8;
+  uint8_t* bmp = (uint8_t*)malloc(wb * h);
+  if(!bmp) { server.send(500,"text/plain","malloc failed"); return; }
+  for (int y=0; y<h; y++) for (int x=0; x<wb; x++)
+    bmp[y*wb + x] = (y < h/2) ? 0xAA : 0x55;
+  unsigned long t0 = millis();
+  printBitmap(bmp, PRINTER_WIDTH, h, bytes, delayMs);
+  unsigned long dt = millis() - t0;
+  free(bmp);
+  feedPaper(3);
+  char logline[128];
+  snprintf(logline, sizeof(logline), "dbg_chunk: chunkSize=%d delay=%dms %lums", bytes, delayMs, dt);
+  logMsg(logline);
+  server.send(200,"text/plain",logline);
+}
+
+void handleDbgCmd() {
+  if(!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
+  String hex = server.arg("hex");
+  hex.replace(" ", ""); hex.replace("\n", ""); hex.replace("\r", "");
+  if (hex.length() % 2 != 0) { server.send(400,"text/plain","Hex must have even length"); return; }
+  int len = hex.length() / 2;
+  uint8_t* buf = (uint8_t*)malloc(len);
+  if(!buf) { server.send(500,"text/plain","malloc failed"); return; }
+  for (int i=0; i<len; i++) {
+    char hc = hex[i*2], lc = hex[i*2+1];
+    auto h2d = [](char c) -> uint8_t {
+      if (c>='0'&&c<='9') return c-'0';
+      if (c>='A'&&c<='F') return c-'A'+10;
+      if (c>='a'&&c<='f') return c-'a'+10;
+      return 0;
+    };
+    buf[i] = (h2d(hc) << 4) | h2d(lc);
+  }
+  for(int i=0; i<len; i+=200) {
+    int sz = min(200, len-i);
+    pWriteCharacteristic->writeValue(&buf[i], sz);
+    delay(10);
+  }
+  free(buf);
+  logMsg("dbg_cmd: " + String(len) + " bytes");
+  server.send(200,"text/plain","Sent " + String(len) + " bytes");
+}
+
+void handleDbgHeap() {
+  String json = "{";
+  json += "\"free\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"maxAlloc\":" + String(ESP.getMaxAllocHeap()) + ",";
+  json += "\"minFree\":" + String(minFreeHeapSeen) + ",";
+  json += "\"bleState\":" + String((int)bleState) + ",";
+  json += "\"printer\":" + String(printerConnected?"true":"false") + ",";
+  json += "\"twitch\":" + String(twitchConnected?"true":"false") + ",";
+  json += "\"uptime\":" + String(millis()/1000);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleDbgWifi() {
+  String json = "{";
+  json += "\"status\":" + String(WiFi.status()) + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"reconnectCount\":" + String(wifiReconnectCount) + ",";
+  json += "\"lastDisconnectReason\":" + String(lastDisconnectReason) + ",";
+  json += "\"lastDisconnectTime\":" + String(lastDisconnectTime) + ",";
+  json += "\"ssid\":\"" + WiFi.SSID() + "\",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+const char debugPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en"><head><title>Debug — C3 Printer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#0f0f23;color:#e0e0e0;padding:10px;max-width:800px;margin:0 auto}
+h1{font-size:18px;color:#f87171;padding:10px 0 6px;text-align:center;letter-spacing:1px}
+h2{font-size:13px;color:#fbbf24;border-bottom:1px solid #3d3d6b;padding-bottom:5px;margin-bottom:8px;text-transform:uppercase}
+.card{background:#1a1a2e;border:1px solid #3d3d6b;border-radius:8px;padding:10px;margin-bottom:10px}
+.stat{padding:2px 8px;border-radius:10px;font-size:11px;font-weight:bold;display:inline-block;margin-right:4px}
+.ok{background:#1a3a2a;color:#4ade80;border:1px solid #166534}
+.err{background:#3a1a1a;color:#f87171;border:1px solid #7f1d1d}
+.warn{background:#3a3a1a;color:#facc15;border:1px solid #7f7f1d}
+#status{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;font-size:11px}
+#status span{background:#0f0f23;padding:3px 8px;border-radius:4px;border:1px solid #2d2d5a}
+#console{border:1px solid #2d2d5a;background:#0a0a1a;color:#4ade80;font-family:monospace;font-size:11px;padding:6px;height:200px;overflow-y:auto;white-space:pre-wrap;border-radius:4px;margin-bottom:6px}
+label{display:block;font-size:11px;color:#9ca3af;margin-top:4px}
+input[type=text],input[type=number],select{background:#0f0f23;color:#e0e0e0;border:1px solid #3d3d6b;border-radius:3px;padding:3px 5px;font-size:12px}
+input[type=number]{width:60px}
+.row{display:flex;gap:6px;align-items:end;flex-wrap:wrap;margin-bottom:4px}
+.row label{font-size:10px;margin-top:0}
+button{padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;color:#fff}
+button.go{background:#6d28d9}
+button.go2{background:#0e7490}
+.result{background:#0f0f23;border:1px solid #2d2d5a;border-radius:3px;padding:4px 6px;font-family:monospace;font-size:11px;margin-top:4px;white-space:pre-wrap;word-break:break-all}
+a{color:#a78bfa;font-size:11px;text-decoration:none}
+a:hover{text-decoration:underline}
+</style></head>
+<body>
+<h1>&#128295; Debug Console</h1>
+
+<div class="card">
+  <h2>Live Status</h2>
+  <div id="status">Loading...</div>
+</div>
+
+<div class="card">
+  <h2>Console Log</h2>
+  <div id="console">Loading...</div>
+</div>
+
+<div class="card">
+  <h2>Test Raw Bitmap</h2>
+  <div class="row">
+    <label>Pattern: <select id="raw_pat"><option value="stripe">Stripe</option><option value="checker">Checker</option><option value="solid">Solid</option></select></label>
+    <label>Width: <input type="number" id="raw_w" value="400" min="1" max="576"></label>
+    <label>Height: <input type="number" id="raw_h" value="16" min="1" max="128"></label>
+    <button class="go" onclick="dbgRaw()">Send</button>
+  </div>
+  <div id="raw_res" class="result"></div>
+</div>
+
+<div class="card">
+  <h2>Test Single Glyph</h2>
+  <div class="row">
+    <label>Codepoint: <input type="number" id="gly_cp" value="65" min="32" max="65535"></label>
+    <button class="go" onclick="dbgGlyph()">Render</button>
+  </div>
+  <div id="gly_res" class="result"></div>
+</div>
+
+<div class="card">
+  <h2>Test One Line</h2>
+  <div class="row">
+    <label>Text: <input type="text" id="line_txt" value="Hello World!" style="width:200px"></label>
+    <label>Scale: <select id="line_sc"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
+    <button class="go" onclick="dbgLine()">Print</button>
+  </div>
+  <div id="line_res" class="result"></div>
+</div>
+
+<div class="card">
+  <h2>BLE Chunk Test</h2>
+  <div class="row">
+    <label>Chunk bytes: <input type="number" id="chk_bytes" value="200" min="32" max="512"></label>
+    <label>Delay ms: <input type="number" id="chk_delay" value="10" min="0" max="200"></label>
+    <button class="go" onclick="dbgChunk()">Send</button>
+  </div>
+  <div id="chk_res" class="result"></div>
+</div>
+
+<div class="card">
+  <h2>Raw ESC/POS Command</h2>
+  <div class="row">
+    <label>Hex bytes: <input type="text" id="cmd_hex" value="1B40" style="width:300px;font-family:monospace" placeholder="e.g. 1B40 or 1D76300002000800FF"></label>
+    <button class="go" onclick="dbgCmd()">Send</button>
+  </div>
+  <div id="cmd_res" class="result"></div>
+</div>
+
+<div class="card">
+  <h2>Heap &amp; WiFi</h2>
+  <div class="row">
+    <button class="go2" onclick="dbgHeap()">Refresh Heap</button>
+    <button class="go2" onclick="dbgWifi()">Refresh WiFi</button>
+  </div>
+  <div id="heap_res" class="result"></div>
+  <div id="wifi_res" class="result"></div>
+</div>
+
+<div style="text-align:center;margin-top:10px">
+  <a href="/">&larr; Main Page</a>
+</div>
+
+<script>
+async function q(url) {
+  try { return await (await fetch(url)).text(); } catch(e) { return 'Error: '+e; }
+}
+function statusHtml(d) {
+  let h = '<span>Printer: <b class="stat '+(d.printer?'ok':'err')+'">'+(d.printer?'Connected':'Offline')+'</b></span>';
+  h += '<span>Twitch: <b class="stat '+(d.twitch?'ok':'err')+'">'+(d.twitch?'Connected':'Offline')+'</b></span>';
+  if(d.free !== undefined) {
+    h += '<span>Heap free: '+d.free+'</span>';
+    h += '<span>MaxAlloc: '+d.maxAlloc+'</span>';
+    h += '<span>MinFree: '+d.minFree+'</span>';
+    h += '<span>Uptime: '+d.uptime+'s</span>';
+  }
+  return h;
+}
+async function refreshStatus() {
+  try {
+    let s = await (await fetch('/s')).json();
+    let h = await (await fetch('/dbg_heap')).json();
+    Object.assign(s, h);
+    document.getElementById('status').innerHTML = statusHtml(s);
+  } catch(e) {}
+}
+async function refreshConsole() {
+  let c = document.getElementById('console');
+  try {
+    let t = await (await fetch('/console')).text();
+    c.textContent = t;
+    c.scrollTop = c.scrollHeight;
+  } catch(e) {}
+}
+async function dbgRaw() {
+  let p = document.getElementById('raw_pat').value;
+  let w = document.getElementById('raw_w').value;
+  let h = document.getElementById('raw_h').value;
+  document.getElementById('raw_res').textContent = await q('/dbg_raw?pattern='+p+'&w='+w+'&h='+h);
+}
+async function dbgGlyph() {
+  let cp = document.getElementById('gly_cp').value;
+  document.getElementById('gly_res').textContent = await q('/dbg_glyph?cp='+cp);
+}
+async function dbgLine() {
+  let txt = document.getElementById('line_txt').value;
+  let sc = document.getElementById('line_sc').value;
+  document.getElementById('line_res').textContent = await q('/dbg_line?text='+encodeURIComponent(txt)+'&scale='+sc);
+}
+async function dbgChunk() {
+  let b = document.getElementById('chk_bytes').value;
+  let d = document.getElementById('chk_delay').value;
+  document.getElementById('chk_res').textContent = await q('/dbg_chunk?bytes='+b+'&delayms='+d);
+}
+async function dbgCmd() {
+  let h = document.getElementById('cmd_hex').value.replace(/[^0-9a-fA-F]/g,'');
+  document.getElementById('cmd_res').textContent = await q('/dbg_cmd?hex='+h);
+}
+async function dbgHeap() {
+  document.getElementById('heap_res').textContent = await q('/dbg_heap');
+}
+async function dbgWifi() {
+  document.getElementById('wifi_res').textContent = await q('/dbg_wifi');
+}
+setInterval(refreshStatus, 2000);
+setInterval(refreshConsole, 1000);
+refreshStatus(); refreshConsole();
+</script></body></html>
+)rawliteral";
+
 // ========== FILE UPLOAD ==========
 
 void handleUpload() {
@@ -938,6 +1342,13 @@ void setup() {
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(MYSSID, MYPSK);
   WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      lastDisconnectReason = info.wifi_sta_disconnected.reason;
+      lastDisconnectTime = millis();
+      wifiReconnectCount++;
+    }
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   logMsg("\nWiFi OK: " + WiFi.localIP().toString());
 
@@ -984,39 +1395,14 @@ void setup() {
     else            { out = String(logBuffer, logHead); }
     server.send(200, "text/plain", out);
   });
-  server.on("/test_raw", []() {
-    if (!printerConnected) { server.send(400,"text/plain","Not connected"); return; }
-    uint8_t bmp[400] = {0};
-    for (int i = 0; i < 400; i++) bmp[i] = 0xAA;
-    printBitmap(bmp, 400, 8);
-    feedPaper(3);
-    server.send(200,"text/plain","Raw bitmap sent");
-  });
-  server.on("/test_width", []() {
-    if (!printerConnected) { server.send(400,"text/plain","No printer"); return; }
-    int widths[] = {384, 400, 416, 576};
-    for (int w : widths) {
-      int wb = w / 8;
-      uint8_t* bmp = (uint8_t*)malloc(wb * 2);
-      if (!bmp) continue;
-      memset(bmp, 0xFF, wb * 2);
-      uint8_t cmd[] = {
-        0x1D, 0x76, 0x30, 0x00,
-        (uint8_t)(wb & 0xFF), (uint8_t)(wb >> 8),
-        0x02, 0x00
-      };
-      pWriteCharacteristic->writeValue(cmd, 8); delay(10);
-      int total = wb * 2;
-      for (int i = 0; i < total; i += 200) {
-        int sz = min(200, total - i);
-        pWriteCharacteristic->writeValue(&bmp[i], sz); delay(10);
-      }
-      free(bmp);
-      feedPaper(2);
-      delay(500);
-    }
-    server.send(200,"text/plain","Width test sent");
-  });
+  server.on("/debug", []() { server.send_P(200, "text/html; charset=UTF-8", debugPage); });
+  server.on("/dbg_raw",   handleDbgRaw);
+  server.on("/dbg_glyph", handleDbgGlyph);
+  server.on("/dbg_line",  handleDbgLine);
+  server.on("/dbg_chunk", handleDbgChunk);
+  server.on("/dbg_cmd",   handleDbgCmd);
+  server.on("/dbg_heap",  handleDbgHeap);
+  server.on("/dbg_wifi",  handleDbgWifi);
   server.on("/ping", []() { server.send(200,"text/plain","pong"); });
   server.on("/log", []() {
     server.send_P(200, "text/html", R"rawliteral(
@@ -1040,12 +1426,17 @@ void loop() {
   static unsigned long discoverStart    = 0;
   unsigned long now = millis();
 
+  {
+    unsigned long f = ESP.getFreeHeap();
+    if (f < minFreeHeapSeen) minFreeHeapSeen = f;
+  }
+
   if (now - lastHeapLog > 10000) {
     lastHeapLog = now;
     char hb[128];
-    snprintf(hb, sizeof(hb), "Uptime %lus free=%u maxAlloc=%u RSSI=%d bleState=%d twitch=%d",
+    snprintf(hb, sizeof(hb), "Uptime %lus free=%u maxAlloc=%u minFree=%u RSSI=%d bleState=%d twitch=%d",
              now/1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
-             WiFi.RSSI(), (int)bleState, (int)twitchConnected);
+             (unsigned int)minFreeHeapSeen, WiFi.RSSI(), (int)bleState, (int)twitchConnected);
     logMsg(hb);
   }
 
