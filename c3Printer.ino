@@ -421,7 +421,7 @@ int drawGlyph(PrintCanvas& canvas, File& fontFile,
   fontFile.seek(g->bitmapOffset);
   fontFile.read(glyphBuf, bmpBytes);
   for (int row = 0; row < g->h; row++) {
-    int py = baseline_y + g->y_off + row;
+    int py = baseline_y - g->y_off + row;
     for (int col = 0; col < g->w; col++) {
       int px = x + g->x_off + col;
       uint8_t byte = glyphBuf[row * rowBytes + col / 8];
@@ -887,7 +887,7 @@ void handleDbgGlyph() {
   String res;
   if (findGlyphInOpenFile(*fp, f, cp, &g)) {
     int w = 20 + g.w + g.x_off;
-    int h = 5 + fp->size + 8;
+    int h = 10 + fp->size + 10;
     PrintCanvas canvas(w, h);
     if(!canvas.buffer) { res = "Canvas alloc failed"; }
     else {
