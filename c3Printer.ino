@@ -929,16 +929,16 @@ void handleDbgLine() {
   if(!canvas.buffer) { server.send(500,"text/plain","Canvas alloc failed"); return; }
   int drawY = lineSpacing + baseline;
   int textIndex = 0;
-  for(int line=0; line<totalLines; line++) {
+  for(int li=0; li<totalLines; li++) {
     int lineEnd = wrapped.indexOf('\n', textIndex);
     if(lineEnd < 0) lineEnd = (int)wrapped.length();
-    String line = wrapped.substring(textIndex, lineEnd);
-    if(line.length() > 0) {
-      int tw = min(measureTextVlwF(line, fBasicHandle, fCJKHandle), renderW - 4);
+    String lineStr = wrapped.substring(textIndex, lineEnd);
+    if(lineStr.length() > 0) {
+      int tw = min(measureTextVlwF(lineStr, fBasicHandle, fCJKHandle), renderW - 4);
       int x = max(2, (renderW - tw) / 2);
-      int ci = 0, clen = (int)line.length();
+      int ci = 0, clen = (int)lineStr.length();
       while (ci < clen) {
-        uint32_t cp = nextCodepoint(line, ci);
+        uint32_t cp = nextCodepoint(lineStr, ci);
         VlwGlyph glyphOut;
         if (fBasicHandle && fontBasic.loaded &&
             findGlyphInOpenFile(fontBasic, fBasicHandle, cp, &glyphOut))
