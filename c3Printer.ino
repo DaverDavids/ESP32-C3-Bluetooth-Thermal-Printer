@@ -1358,7 +1358,15 @@ void setup() {
       wifiReconnectCount++;
     }
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-  while(WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  int wifiRetries = 0;
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+    if (++wifiRetries >= 20) {
+      logMsg("WiFi timeout — retrying");
+      WiFi.disconnect(); WiFi.begin(MYSSID, MYPSK);
+      wifiRetries = 0;
+    }
+  }
   logMsg("WiFi OK. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   if(MDNS.begin(hostname)) { MDNS.addService("http","tcp",80); logMsg("mDNS OK. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap())); }
   ArduinoOTA.setHostname(hostname);
