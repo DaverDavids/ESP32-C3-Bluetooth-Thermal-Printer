@@ -95,11 +95,12 @@ struct VlwGlyph {
 };
 
 struct VlwFont {
-  int      count;
-  int      size;
-  uint32_t indexStart;
-  char*    path;
-  bool     loaded;
+  int       count;
+  int       size;
+  uint32_t  indexStart;
+  char*     path;
+  uint32_t* offsets;
+  bool      loaded;
 };
 
 VlwFont fontBasic = {0};
@@ -191,26 +192,24 @@ bool loadVlw(VlwFont& f, const char* path) {
   f.size  = read32();
   read32(); read32(); read32();
   f.indexStart = file.position();
+  f.offsets = (uint32_t*)malloc(f.count * sizeof(uint32_t));
+  uint32_t runningOff = f.indexStart + (uint32_t)f.count * 24;
+  for (int i = 0; i < f.count; i++) {
+    f.offsets[i] = runningOff;
+    read32();              // skip cp
+    int16_t h = (int16_t)read32();
+    int16_t w = (int16_t)read32();
+    read32();              // skip advance
+    read32();              // skip x_off
+    read32();              // skip y_off
+    runningOff += (uint32_t)((w + 7) / 8) * (uint32_t)h;
+  }
   file.close();
   if (f.path) free(f.path);
   f.path   = strdup(path);
   f.loaded = true;
-  logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs, 0 bytes heap)");
+  logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs, " + String(f.count * 4) + " bytes heap)");
   return true;
-}
-
-// ========== GLYPH OFFSET CALCULATOR ==========
-
-uint32_t findGlyphOffset(const VlwFont& f, File& file, int idx) {
-  uint32_t bmpOff = f.indexStart + (uint32_t)f.count * 24;
-  for (int i = 0; i < idx; i++) {
-    file.seek(f.indexStart + i * 24 + 4);
-    uint8_t b[8]; file.read(b, 8);
-    int16_t h = (int16_t)((b[0]<<8)|b[1]);
-    int16_t w = (int16_t)((b[4]<<8)|b[5]);
-    bmpOff += (uint32_t)((w + 7) / 8) * (uint32_t)h;
-  }
-  return bmpOff;
 }
 
 // ========== GLYPH LOOKUP ==========
@@ -238,7 +237,7 @@ bool findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* ou
       out->advance = (int16_t)read32();
       out->x_off   = (int16_t)read32();
       out->y_off   = (int16_t)read32();
-      out->bitmapOffset = findGlyphOffset(f, file, mid);
+      out->bitmapOffset = f.offsets[mid];
       return true;
     } else if (midCp < cp) lo = mid + 1;
     else                   hi = mid - 1;
@@ -409,9 +408,6 @@ void feedPaper(int lines) {
 int drawGlyph(PrintCanvas& canvas, File& fontFile,
               const VlwGlyph* g, int x, int baseline_y, bool invert) {
   if (!g || g->w == 0 || g->h == 0) return g ? g->advance : 0;
-  logMsg("drawGlyph cp=" + String(g->cp) + " x=" + String(x) +
-         " baseline=" + String(baseline_y) + " yoff=" + String(g->y_off) +
-         " py0=" + String(baseline_y + g->y_off));
   int rowBytes = (g->w + 7) / 8;
   int bmpBytes = rowBytes * g->h;
   if (bmpBytes > MAX_GLYPH_BYTES) {
@@ -419,7 +415,9 @@ int drawGlyph(PrintCanvas& canvas, File& fontFile,
     return g->advance;
   }
   fontFile.seek(g->bitmapOffset);
-  fontFile.read(glyphBuf, bmpBytes);
+  memset(glyphBuf, 0, bmpBytes);
+  int got = fontFile.read(glyphBuf, bmpBytes);
+  if (got != bmpBytes) logMsg("WARN: short glyph read");
   for (int row = 0; row < g->h; row++) {
     int py = baseline_y - g->y_off + row;
     for (int col = 0; col < g->w; col++) {
@@ -1474,10 +1472,12 @@ void loop() {
     if (twitchConnected) {
       handleTwitchIRC();
     } else if (twitchEverConnected && now - lastTwitchRetry > 10000) {
+      twitchClient.stop();
       lastTwitchRetry = now;
       connectTwitch();
     } else if (!twitchEverConnected && now >= bleDeadlineMs && now - lastTwitchRetry > 10000) {
       logMsg("BLE deadline — connecting Twitch unconditionally");
+      twitchClient.stop();
       lastTwitchRetry = now;
       connectTwitch();
     }
