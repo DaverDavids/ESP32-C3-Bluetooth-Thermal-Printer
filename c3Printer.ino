@@ -95,12 +95,11 @@ struct VlwGlyph {
 };
 
 struct VlwFont {
-  int       count;
-  int       size;
-  uint32_t  indexStart;
-  char*     path;
-  uint32_t* offsets;
-  bool      loaded;
+  int      count;
+  int      size;
+  uint32_t indexStart;
+  char*    path;
+  bool     loaded;
 };
 
 VlwFont fontBasic = {0};
@@ -192,24 +191,26 @@ bool loadVlw(VlwFont& f, const char* path) {
   f.size  = read32();
   read32(); read32(); read32();
   f.indexStart = file.position();
-  f.offsets = (uint32_t*)malloc(f.count * sizeof(uint32_t));
-  uint32_t runningOff = f.indexStart + (uint32_t)f.count * 24;
-  for (int i = 0; i < f.count; i++) {
-    f.offsets[i] = runningOff;
-    read32();              // skip cp
-    int16_t h = (int16_t)read32();
-    int16_t w = (int16_t)read32();
-    read32();              // skip advance
-    read32();              // skip x_off
-    read32();              // skip y_off
-    runningOff += (uint32_t)((w + 7) / 8) * (uint32_t)h;
-  }
   file.close();
   if (f.path) free(f.path);
   f.path   = strdup(path);
   f.loaded = true;
-  logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs, " + String(f.count * 4) + " bytes heap)");
+  logMsg("VLW loaded: " + String(path) + " (" + String(f.count) + " glyphs)");
   return true;
+}
+
+// ========== GLYPH OFFSET CALCULATOR ==========
+
+uint32_t findGlyphOffset(const VlwFont& f, File& file, int idx) {
+  uint32_t bmpOff = f.indexStart + (uint32_t)f.count * 24;
+  for (int i = 0; i < idx; i++) {
+    file.seek(f.indexStart + i * 24 + 4);
+    uint8_t b[8]; file.read(b, 8);
+    int16_t h = (int16_t)((b[0]<<8)|b[1]);
+    int16_t w = (int16_t)((b[4]<<8)|b[5]);
+    bmpOff += (uint32_t)((w + 7) / 8) * (uint32_t)h;
+  }
+  return bmpOff;
 }
 
 // ========== GLYPH LOOKUP ==========
@@ -237,7 +238,7 @@ bool findGlyphInOpenFile(const VlwFont& f, File& file, uint32_t cp, VlwGlyph* ou
       out->advance = (int16_t)read32();
       out->x_off   = (int16_t)read32();
       out->y_off   = (int16_t)read32();
-      out->bitmapOffset = f.offsets[mid];
+      out->bitmapOffset = findGlyphOffset(f, file, mid);
       return true;
     } else if (midCp < cp) lo = mid + 1;
     else                   hi = mid - 1;
@@ -681,13 +682,16 @@ void connectPrinter() {
            " maxAlloc=" + String(ESP.getMaxAllocHeap()) + ")");
     return;
   }
-  logMsg("BLE connecting: " + printerMAC);
+  logMsg("BLE connecting: " + printerMAC + " free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   BLEDevice::init("ESP32-C3-Printer");
+  logMsg("BLE init. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   if(pClient) { delete pClient; pClient = nullptr; }
   pClient = BLEDevice::createClient();
+  logMsg("createClient. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   pClient->setClientCallbacks(new MyClientCallback());
   bleState = BLE_CONNECTING;
   pClient->connect(BLEAddress(printerMAC.c_str()), false);
+  logMsg("connect issued. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
 }
 
 void disconnectPrinter() {
@@ -1327,8 +1331,11 @@ void setup() {
   // the default of 10. We need at most 3 simultaneous file handles
   // (2 font files during render + 1 upload file), so 4 is safe.
   LittleFS.begin(true, "/littlefs", 4);
+  logMsg("FS mounted. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   loadVlw(fontBasic, "/unifont_basic.vlw");
+  logMsg("Basic font. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   loadVlw(fontCJK,   "/unifont_cjk.vlw");
+  logMsg("CJK font. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
   LittleFS.end();
   // Diagnostic: verify glyph 'A' can be read from the font file
   LittleFS.begin(false, "/littlefs", 4);
@@ -1509,6 +1516,7 @@ void loop() {
       if (svc) {
         pWriteCharacteristic = svc->getCharacteristic(charWriteUUID);
         if (pWriteCharacteristic) {
+          logMsg("Discovery OK. free=" + String(ESP.getFreeHeap()) + " maxAlloc=" + String(ESP.getMaxAllocHeap()));
           discoverStart = 0; bleState = BLE_INITING;
         } else {
           logMsg("BLE char not found");
